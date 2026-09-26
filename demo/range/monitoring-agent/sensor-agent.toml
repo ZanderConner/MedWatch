@@ -1,0 +1,30 @@
+# MedWatch sensor-agent config for the demo range's monitoring-agent
+# container (agents/sensor-agent/Dockerfile). Bind-mounted over the
+# image's baked-in default at /etc/medwatch/sensor-agent.toml — do not
+# bake range-specific config into the image itself.
+
+[sensor]
+id = "sensor-medsim-range"
+site = "medsim-demo-range"
+
+[capture]
+# The container has two NICs (agent_siem_net + orthanc_private_net /
+# hl7_private_net); "any" captures on all of them so traffic on whichever
+# interface Docker assigns doesn't get missed.
+interface = "any"
+snaplen = 262144
+promiscuous = true
+bpf_filter = "not port 22"
+asset_flush_interval_secs = 60
+
+# The team's backend ingest API isn't built yet (backend/ is still an
+# empty scaffold) — dry_run below means the agent captures, parses, and
+# fingerprints for real but only logs counts instead of POSTing anywhere.
+# Flip dry_run off (drop --dry-run from the compose command) once
+# POST /api/v1/events and /api/v1/assets exist on the siem service.
+[backend]
+url = "http://siem:8080"
+api_key = "change-me"
+batch_size = 500
+flush_interval_secs = 5
+verify_tls = false

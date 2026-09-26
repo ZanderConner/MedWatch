@@ -1,0 +1,517 @@
+name: medsim-range
+
+services:
+  router:
+    build:
+      context: ./range/router
+    container_name: medsim-router
+    hostname: medsim-router
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      emr_net:
+        ipv4_address: 10.20.10.1
+      hl7_net:
+        ipv4_address: 10.20.20.1
+      pacs_net:
+        ipv4_address: 10.20.30.1
+      lone_linux_net:
+        ipv4_address: 10.20.40.1
+    volumes:
+      - ./captures:/captures
+    restart: unless-stopped
+
+  openemr-db:
+    image: mariadb:12.3
+    container_name: openemr-db
+    hostname: openemr-db
+    command: ["mariadbd", "--character-set-server=utf8mb4"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MARIADB_AUTO_UPGRADE: "1"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      emr_net:
+        ipv4_address: 10.20.10.11
+    volumes:
+      - openemr-db:/var/lib/mysql
+    restart: unless-stopped
+
+  openemr:
+    image: openemr/openemr:8.4.1
+    container_name: openemr
+    hostname: openemr
+    cap_add:
+      - NET_ADMIN
+    environment:
+      MYSQL_HOST: openemr-db
+      MYSQL_ROOT_PASS: root
+      MYSQL_USER: openemr
+      MYSQL_PASS: openemr
+      OE_USER: admin
+      OE_PASS: pass
+    depends_on:
+      openemr-db:
+        condition: service_healthy
+      router:
+        condition: service_started
+    ports:
+      - "8080:80"
+      - "8444:443"
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--insecure", "--location", "--show-error", "--silent", "https://localhost/meta/health/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    networks:
+      emr_net:
+        ipv4_address: 10.20.10.10
+    volumes:
+      - openemr-sites:/var/www/localhost/htdocs/openemr/sites
+      - openemr-logs:/var/log
+    restart: unless-stopped
+
+  openemr-route:
+    build:
+      context: ./range/host
+    container_name: openemr-route
+    network_mode: service:openemr
+    cap_add:
+      - NET_ADMIN
+    environment:
+      RANGE_GATEWAY: 10.20.10.1
+    depends_on:
+      openemr:
+        condition: service_started
+    command: ["/usr/local/bin/route-default.sh"]
+    restart: unless-stopped
+
+  mirth-db:
+    image: postgres:16
+    container_name: mirth-db
+    hostname: mirth-db
+    environment:
+      POSTGRES_USER: mirthdb
+      POSTGRES_PASSWORD: mirthdb
+      POSTGRES_DB: mirthdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mirthdb -d mirthdb"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    networks:
+      hl7_net:
+        ipv4_address: 10.20.20.11
+    volumes:
+      - mirth-db:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  mirth:
+    image: nextgenhealthcare/connect:4.5.2-jdk
+    container_name: mirth
+    hostname: mirth
+    cap_add:
+      - NET_ADMIN
+    environment:
+      DATABASE: postgres
+      DATABASE_URL: jdbc:postgresql://mirth-db:5432/mirthdb
+      DATABASE_USERNAME: mirthdb
+      DATABASE_PASSWORD: mirthdb
+      DATABASE_MAX_CONNECTIONS: 20
+      DATABASE_MAX_RETRY: 10
+      DATABASE_RETRY_WAIT: 10000
+      KEYSTORE_STOREPASS: docker_storepass
+      KEYSTORE_KEYPASS: docker_keypass
+      VMOPTIONS: -Xmx512m
+    depends_on:
+      mirth-db:
+        condition: service_healthy
+      router:
+        condition: service_started
+    ports:
+      - "8081:8080"
+      - "8443:8443"
+      - "6661:6661"
+    networks:
+      hl7_net:
+        ipv4_address: 10.20.20.10
+      orthanc_private_net:
+        ipv4_address: 10.20.50.12
+    volumes:
+      - mirth-appdata:/opt/connect/appdata
+    restart: unless-stopped
+
+  mirth-route:
+    build:
+      context: ./range/host
+    container_name: mirth-route
+    network_mode: service:mirth
+    cap_add:
+      - NET_ADMIN
+    environment:
+      RANGE_GATEWAY: 10.20.20.1
+    depends_on:
+      mirth:
+        condition: service_started
+    command: ["/usr/local/bin/route-default.sh"]
+    restart: unless-stopped
+
+  orthanc:
+    image: orthancteam/orthanc:26.9.1-full
+    container_name: orthanc
+    hostname: orthanc
+    cap_add:
+      - NET_ADMIN
+    environment:
+      VERBOSE_ENABLED: "true"
+      ORTHANC_JSON: |
+        {
+          "Name": "MedSim Orthanc",
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": true,
+          "RegisteredUsers": {
+            "orthanc": "orthanc"
+          },
+          "DicomAet": "ORTHANC",
+          "DicomPort": 4242,
+          "HttpPort": 8042,
+          "DicomModalities": {
+            "dicom-simulator": ["DICOMSIM", "10.20.50.21", 104]
+          }
+        }
+    depends_on:
+      router:
+        condition: service_started
+    ports:
+      - "8042:8042"
+      - "4242:4242"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u orthanc:orthanc http://localhost:8042/system >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      pacs_net:
+        ipv4_address: 10.20.30.10
+      orthanc_private_net:
+        ipv4_address: 10.20.50.10
+    volumes:
+      - orthanc-db:/var/lib/orthanc/db
+    restart: unless-stopped
+
+  orthanc-route:
+    build:
+      context: ./range/host
+    container_name: orthanc-route
+    network_mode: service:orthanc
+    cap_add:
+      - NET_ADMIN
+    environment:
+      RANGE_GATEWAY: 10.20.30.1
+    depends_on:
+      orthanc:
+        condition: service_started
+    command: ["/usr/local/bin/route-default.sh"]
+    restart: unless-stopped
+
+  dicom-simulator:
+    build:
+      context: ./simulators
+    container_name: dicom-simulator
+    hostname: dicom-simulator
+    environment:
+      LAB_ROLE: dicom-simulator
+      MODALITY: CT
+      DEVICE_MODALITY_LABEL: CT
+      AET: DICOMSIM
+      TARGET_HOST: 10.20.50.10
+      TARGET_PORT: 4242
+      TARGET_AET: ORTHANC
+      DICOM_LISTEN_PORT: 104
+      PATIENT_POOL_CSV: /app/patients.csv
+      TCIA_DATA_DIR: /tcia_data/CT
+      TCIA_WAIT_MINUTES: 0
+      SEND_INTERVAL: 120
+      STUDIES_PER_BURST: 1
+      WORK_HOURS_START: "00:00"
+      WORK_HOURS_END: "00:00"
+      TZ: America/New_York
+      JITTER_MIN_SECONDS: 5
+      JITTER_MAX_SECONDS: 20
+      ACCESSION_PREFIX: MED
+      HOSPITAL_NAME: MedSim Medical Center
+      HOSPITAL_ADDRESS: 100 Simulation Way
+    networks:
+      orthanc_private_net:
+        ipv4_address: 10.20.50.21
+    volumes:
+      - tcia-dicoms:/tcia_data:ro
+      - ./simulators/patients.csv:/app/patients.csv:ro
+    restart: unless-stopped
+
+  hl7-simulator:
+    build:
+      context: ./hematology-sim
+    container_name: hl7-simulator
+    hostname: hl7-simulator
+    command:
+      - python
+      - -u
+      - analyzer.py
+      - --listen-host
+      - 0.0.0.0
+      - --listen-port
+      - "6660"
+      - --send-host
+      - 10.20.50.12
+      - --send-port
+      - "6661"
+      - --min-delay
+      - "8"
+      - --max-delay
+      - "20"
+      - --sending-app
+      - HEMA-3000
+      - --sending-facility
+      - HEMATOLOGY
+      - --receiving-app
+      - MIRTH
+      - --receiving-facility
+      - MEDSIM
+    networks:
+      orthanc_private_net:
+        ipv4_address: 10.20.50.22
+    restart: unless-stopped
+
+  hl7-order-generator:
+    build:
+      context: ./hematology-sim
+    container_name: hl7-order-generator
+    hostname: hl7-order-generator
+    command:
+      - python
+      - -u
+      - order_generator.py
+      - --target-host
+      - "10.20.20.10"
+      - --target-port
+      - "6662"
+      - --patients-csv
+      - /app/patients.csv
+      - --min-interval
+      - "30"
+      - --max-interval
+      - "90"
+      - --sending-app
+      - OE-CPOE
+      - --sending-facility
+      - MEDSIM
+      - --receiving-app
+      - LIS
+      - --receiving-facility
+      - HEMATOLOGY
+    depends_on:
+      mirth-bootstrap:
+        condition: service_completed_successfully
+    networks:
+      hl7_net:
+        ipv4_address: 10.20.20.30
+    volumes:
+      - ./simulators/patients.csv:/app/patients.csv:ro
+    restart: unless-stopped
+
+  monitoring-agent:
+    build:
+      context: ..
+      dockerfile: agents/sensor-agent/Dockerfile
+    container_name: monitoring-agent
+    hostname: monitoring-agent
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      LAB_ROLE: monitoring-agent
+    # Real MedWatch sensor agent (agents/sensor-agent). --dry-run because
+    # the siem service doesn't expose a real ingest API yet (backend/ is
+    # still an empty scaffold) — the agent captures/parses/fingerprints
+    # for real and logs counts instead of POSTing. Drop --dry-run once
+    # POST /api/v1/events and /api/v1/assets exist on siem:8080.
+    #
+    # NOTE: bridge-attached like this (interface "any" on its own veth),
+    # the agent only sees ITS OWN traffic plus broadcast/multicast — a
+    # Docker bridge is a learning switch, not a hub, so unicast frames
+    # between two OTHER containers never reach this one even in
+    # promiscuous mode. Verified empirically. For full-traffic validation
+    # (seeing dicom-simulator<->orthanc, mirth<->hl7-simulator, etc) use
+    # the bridge-tap technique in
+    # demo/range/monitoring-agent/TAP-VALIDATION.md instead. A real
+    # OT-subnet deployment needs an actual SPAN/mirror port or network tap
+    # on the physical switch for the same reason.
+    command:
+      [
+        "--config",
+        "/etc/medwatch/sensor-agent.toml",
+        "--interface",
+        "any",
+        "--dry-run",
+      ]
+    volumes:
+      - ./range/monitoring-agent/sensor-agent.toml:/etc/medwatch/sensor-agent.toml:ro
+    networks:
+      orthanc_private_net:
+        ipv4_address: 10.20.50.23
+      agent_siem_net:
+        ipv4_address: 10.20.60.20
+    restart: unless-stopped
+
+  siem:
+    build:
+      context: ./range/host
+    container_name: siem
+    hostname: siem
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      LAB_ROLE: siem
+    # Blank placeholder: holds this container's hostname/IPs/network
+    # attachments in the range topology for the real SIEM, not yet
+    # implemented. Replace this command with the real SIEM's entrypoint
+    # when it's integrated. The one-line route fixup (no script file) keeps
+    # `docker compose exec siem probe-range` able to reach routed segments.
+    command: ["sh", "-c", "ip route replace default via 10.20.40.1; sleep infinity"]
+    depends_on:
+      router:
+        condition: service_started
+    ports:
+      - "9000:8080"
+    networks:
+      lone_linux_net:
+        ipv4_address: 10.20.40.10
+      agent_siem_net:
+        ipv4_address: 10.20.60.10
+    volumes:
+      - siem-data:/var/log/medsim-siem
+    restart: unless-stopped
+
+  openemr-seed:
+    image: mariadb:12.3
+    container_name: openemr-seed
+    depends_on:
+      openemr:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: root
+    networks:
+      emr_net: {}
+    volumes:
+      - ./openemr/seed:/seed:ro
+    command: ["bash", "/seed/seed-openemr.sh"]
+    restart: "no"
+
+  mirth-bootstrap:
+    image: curlimages/curl:8.10.1
+    container_name: mirth-bootstrap
+    depends_on:
+      mirth:
+        condition: service_started
+    networks:
+      hl7_net: {}
+    volumes:
+      - ./mirth/bootstrap:/bootstrap:ro
+    command: ["/bin/sh", "/bootstrap/bootstrap-mirth.sh"]
+    restart: "no"
+
+  openemr-bridge:
+    build:
+      context: ./openemr-bridge
+    container_name: openemr-bridge
+    hostname: openemr-bridge
+    command:
+      - python
+      - -u
+      - bridge.py
+      - --listen-host
+      - "0.0.0.0"
+      - --listen-port
+      - "6661"
+      - --db-host
+      - openemr-db
+      - --db-user
+      - openemr
+      - --db-password
+      - openemr
+      - --db-name
+      - openemr
+    depends_on:
+      openemr-db:
+        condition: service_healthy
+      openemr-seed:
+        condition: service_completed_successfully
+    networks:
+      emr_net:
+        ipv4_address: 10.20.10.20
+      hl7_net:
+        ipv4_address: 10.20.20.40
+    restart: unless-stopped
+
+networks:
+  emr_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.10.0/24
+          gateway: 10.20.10.254
+  hl7_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.20.0/24
+          gateway: 10.20.20.254
+  pacs_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.30.0/24
+          gateway: 10.20.30.254
+  lone_linux_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.40.0/24
+          gateway: 10.20.40.254
+  orthanc_private_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.50.0/24
+          gateway: 10.20.50.254
+  agent_siem_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.60.0/24
+          gateway: 10.20.60.254
+
+volumes:
+  openemr-db:
+  openemr-sites:
+  openemr-logs:
+  mirth-db:
+  mirth-appdata:
+  orthanc-db:
+  tcia-dicoms:
+  siem-data:

@@ -1,0 +1,8 @@
+[package]
+name = "medwatch-proto-dicom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
