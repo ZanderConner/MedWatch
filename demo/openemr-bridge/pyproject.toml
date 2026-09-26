@@ -1,0 +1,16 @@
+[project]
+name = "openemr-hl7-bridge"
+version = "1.0.0"
+description = "Receives ORU^R01 lab results over MLLP and files them into the matching OpenEMR patient's chart"
+requires-python = ">=3.12"
+dependencies = [
+    "hl7>=0.4.5",
+    "pymysql>=1.1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+compile-bytecode = true
