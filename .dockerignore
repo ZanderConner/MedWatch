@@ -6,4 +6,6 @@ demo/**/data
 backend/node_modules
 backend/data
 backend/.env
+frontend/node_modules
+frontend/dist
 

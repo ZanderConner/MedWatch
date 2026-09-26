@@ -1,79 +1,218 @@
 import React, { useState, useEffect, useMemo } from 'react';
 
-const LATEST_VER = "0.4.2";
-const API_URL = "http://localhost:8000";
+// Base URL of the MedWatch backend's read API. Configurable via Vite env
+// (VITE_API_URL) so a build can point at a different backend without
+// code changes; defaults to the backend's own default port (see
+// backend/shared/config.js and backend/.env.example — 8080, or whatever
+// the demo range publishes it as on the host, e.g. 9000).
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 
-const FALLBACK_AGENTS = [
-  { sensor_id: "sensor-icu-3rdfloor", hostname: "mw-tap-icu03.clinical.local", version: "0.4.2", rust_target: "aarch64-unknown-linux-gnu", os_kernel: "Debian 12 (Linux 6.1)", interface: "eth0 (SPAN 4)", bpf_filter: "tcp port 104 or tcp port 2575 or port 443 or port 53", batch_interval_ms: 2000, uptime: "14d 06h 18m", cpu_pct: 4.2, mem_mb: 28.4, dissectors: ["dicom", "hl7", "https", "dns"] },
-  { sensor_id: "sensor-er-west", hostname: "mw-tap-erwest.clinical.local", version: "0.4.1", rust_target: "x86_64-unknown-linux-musl", os_kernel: "Alpine 3.19 (Linux 6.6)", interface: "ens192 (VLAN 120)", bpf_filter: "tcp port 104 or tcp port 2575 or port 80 or port 53", batch_interval_ms: 5000, uptime: "08d 19h 42m", cpu_pct: 3.1, mem_mb: 24.0, dissectors: ["dicom", "hl7", "http", "dns"] }
+// Shared admin API key, baked in at build time (see frontend/Dockerfile
+// and demo/docker-compose.yml's frontend service — must match the
+// backend's MEDWATCH_API_KEY). Hackathon-simple: one static key, same
+// pattern the sensor agent itself uses (backend/shared/auth.js). Only
+// needed for the Asset Inventory page's write actions (manual add /
+// confirm / delete) — every read in this app stays unauthenticated.
+const ADMIN_API_KEY = import.meta.env.VITE_ADMIN_API_KEY || 'change-me';
+
+async function adminFetch(path, options = {}) {
+  const res = await fetch(`${API_URL}${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `ApiKey ${ADMIN_API_KEY}`,
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `${path} -> ${res.status}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+// Fallback data shown before the first successful fetch (or if the
+// backend is unreachable) so the UI never renders empty/broken on load.
+const FALLBACK_SENSORS = [
+  { sensor_id: "sensor-icu-3rdfloor", last_seen: null, event_count: 0, asset_count: 0, active: false }
 ];
 
 const FALLBACK_ASSETS = [
   { asset_id: "00:1b:63:84:45:e6", sensor_id: "sensor-icu-3rdfloor", device_identity_hint: "CT Scanner (Bay 3)", os_guess: "linux", ip_addresses: ["10.0.0.5"], observed_protocols: ["dicom", "https"] },
-  { asset_id: "00:14:22:01:23:45", sensor_id: "sensor-icu-3rdfloor", device_identity_hint: "Infusion Pump #04", os_guess: "embedded", ip_addresses: ["10.0.0.42"], observed_protocols: ["hl7"] },
-  { asset_id: "ac:de:48:00:11:22", sensor_id: "sensor-er-west", device_identity_hint: "Bedside Monitor Rm 12", os_guess: "embedded", ip_addresses: ["10.0.0.18"], observed_protocols: ["http", "dns"] }
+  { asset_id: "00:14:22:01:23:45", sensor_id: "sensor-icu-3rdfloor", device_identity_hint: "Infusion Pump #04", os_guess: "embedded-or-iot", ip_addresses: ["10.0.0.42"], observed_protocols: ["hl7"] }
 ];
 
 const FALLBACK_EVENTS = [
-  { event_id: "3fa85f64-5717", sensor_id: "sensor-icu-3rdfloor", "@timestamp": "2026-09-25T22:18:10Z", src_ip: "10.0.0.5", src_port: 51000, dst_ip: "10.0.0.20", dst_port: 104, application: "dicom", length_bytes: 1480, protocol_metadata: { called_ae_title: "PACS_MAIN", calling_ae_title: "CT_SCANNER_3" }, is_suspicious: false },
-  { event_id: "4ab19c12-1234", sensor_id: "sensor-icu-3rdfloor", "@timestamp": "2026-09-25T22:19:05Z", src_ip: "10.0.0.5", src_port: 51002, dst_ip: "10.0.0.20", dst_port: 104, application: "dicom", length_bytes: 4096, protocol_metadata: { called_ae_title: "PACS_MAIN", calling_ae_title: "CT_SCANNER_3" }, is_suspicious: false },
-  { event_id: "5cd28e44-2345", sensor_id: "sensor-er-west", "@timestamp": "2026-09-25T22:20:40Z", src_ip: "10.0.0.18", src_port: 53120, dst_ip: "10.0.0.1", dst_port: 80, application: "http", length_bytes: 640, protocol_metadata: { host: "internal-ehr.local", method: "GET" }, is_suspicious: false },
-  { event_id: "7bc12e91-8812", sensor_id: "sensor-icu-3rdfloor", "@timestamp": "2026-09-25T22:21:15Z", src_ip: "10.0.0.42", src_port: 49152, dst_ip: "198.51.100.14", dst_port: 2575, application: "hl7", length_bytes: 2150, protocol_metadata: { warning: "Unencrypted clinical stream to external IP", peer: "198.51.100.14" }, is_suspicious: true },
-  { event_id: "8de91a04-9912", sensor_id: "sensor-icu-3rdfloor", "@timestamp": "2026-09-25T22:22:30Z", src_ip: "10.0.0.42", src_port: 49155, dst_ip: "10.0.0.30", dst_port: 2575, application: "hl7", length_bytes: 980, protocol_metadata: { message_type: "ORU^R01" }, is_suspicious: false },
-  { event_id: "9cb22a01-1111", sensor_id: "sensor-er-west", "@timestamp": "2026-09-25T22:23:10Z", src_ip: "10.0.0.18", src_port: 5353, dst_ip: "8.8.8.8", dst_port: 53, application: "dns", length_bytes: 128, protocol_metadata: { query: "time.nist.gov" }, is_suspicious: false },
-  { event_id: "1ef99b22-4411", sensor_id: "sensor-er-west", "@timestamp": "2026-09-25T22:24:00Z", src_ip: "10.0.0.18", src_port: 58211, dst_ip: "203.0.113.55", dst_port: 80, application: "http", length_bytes: 1820, protocol_metadata: { warning: "Unexpected outbound HTTP POST from bedside monitor" }, is_suspicious: true },
-  { event_id: "2fa44c88-7721", sensor_id: "sensor-icu-3rdfloor", "@timestamp": "2026-09-25T22:25:12Z", src_ip: "10.0.0.5", src_port: 51010, dst_ip: "10.0.0.20", dst_port: 443, application: "https", length_bytes: 3120, protocol_metadata: { sni: "pacs-gateway.local" }, is_suspicious: false }
+  { event_id: "3fa85f64-5717", sensor_id: "sensor-icu-3rdfloor", "@timestamp": "2026-09-25T22:18:10Z", src_ip: "10.0.0.5", src_port: 51000, dst_ip: "10.0.0.20", dst_port: 104, application: "dicom", length_bytes: 1480, protocol_metadata: { called_ae_title: "PACS_MAIN", calling_ae_title: "CT_SCANNER_3" } }
 ];
+
+const FALLBACK_ALERTS = [];
+
+// GET helper: unwraps the backend's { <key>: [...] } envelope shape
+// (every list endpoint wraps its array — see backend/api/routes.js,
+// backend/alerting/routes.js, backend/api/sensors.js) and never throws
+// on a network/parse error, so a down backend degrades to the fallback
+// data above instead of crashing the page.
+async function fetchList(path, key) {
+  const res = await fetch(`${API_URL}${path}`);
+  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+  const body = await res.json();
+  return body[key] ?? [];
+}
 
 export default function App() {
   const [assets, setAssets] = useState(FALLBACK_ASSETS);
   const [events, setEvents] = useState(FALLBACK_EVENTS);
-  const [agentMeta, setAgentMeta] = useState(FALLBACK_AGENTS);
+  const [sensors, setSensors] = useState(FALLBACK_SENSORS);
+  const [alerts, setAlerts] = useState(FALLBACK_ALERTS);
+  const [stats, setStats] = useState(null);
+  const [inventory, setInventory] = useState([]);
+  const [inventoryError, setInventoryError] = useState(null);
+  const [inventoryFilter, setInventoryFilter] = useState('PENDING');
+  const [addForm, setAddForm] = useState({ device_identity_hint: '', ip_addresses: '', mac_address: '', os_guess: 'unknown' });
   const [page, setPage] = useState('OVERVIEW');
   const [sensor, setSensor] = useState('ALL');
   const [filter, setFilter] = useState('ALL');
   const [modal, setModal] = useState(null);
 
+  const loadInventory = async () => {
+    try {
+      const body = await adminFetch('/api/v1/admin/assets');
+      setInventory(body.assets ?? []);
+      setInventoryError(null);
+    } catch (err) {
+      setInventoryError(err.message);
+    }
+  };
+
   useEffect(() => {
+    let cancelled = false;
     const load = async () => {
       try {
-        const [aRes, eRes] = await Promise.all([fetch(`${API_URL}/api/v1/assets`), fetch(`${API_URL}/api/v1/events`)]);
-        if (aRes.ok && eRes.ok) { setAssets(await aRes.json()); setEvents(await eRes.json()); }
-        const agRes = await fetch(`${API_URL}/api/v1/agents`);
-        if (agRes.ok) setAgentMeta(await agRes.json());
-      } catch {}
+        const [a, e, s, al, st] = await Promise.all([
+          fetchList('/api/v1/assets?limit=500', 'assets'),
+          fetchList('/api/v1/events?limit=500', 'events'),
+          fetchList('/api/v1/sensors', 'sensors'),
+          fetchList('/api/v1/alerts?limit=200', 'alerts'),
+          fetch(`${API_URL}/api/v1/stats`).then((r) => (r.ok ? r.json() : null)),
+        ]);
+        if (!cancelled) {
+          setAssets(a);
+          setEvents(e);
+          setSensors(s);
+          setAlerts(al);
+          if (st) setStats(st);
+        }
+      } catch {
+        // Backend unreachable or returned an error — keep whatever data
+        // is already on screen (fallback or last-good fetch) rather than
+        // clearing it.
+      }
     };
     load();
-    const id = setInterval(load, 5000);
-    return () => clearInterval(id);
+    loadInventory();
+    const id = setInterval(() => { load(); loadInventory(); }, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
+  const confirmAsset = async (assetId) => {
+    try {
+      await adminFetch(`/api/v1/admin/assets/${encodeURIComponent(assetId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ confirmed: true }),
+      });
+      loadInventory();
+    } catch (err) {
+      setInventoryError(err.message);
+    }
+  };
+
+  const removeAsset = async (assetId) => {
+    try {
+      await adminFetch(`/api/v1/admin/assets/${encodeURIComponent(assetId)}`, { method: 'DELETE' });
+      loadInventory();
+    } catch (err) {
+      setInventoryError(err.message);
+    }
+  };
+
+  const submitManualAsset = async (ev) => {
+    ev.preventDefault();
+    if (!addForm.device_identity_hint.trim()) return;
+    try {
+      await adminFetch('/api/v1/admin/assets', {
+        method: 'POST',
+        body: JSON.stringify({
+          device_identity_hint: addForm.device_identity_hint.trim(),
+          ip_addresses: addForm.ip_addresses.split(',').map(s => s.trim()).filter(Boolean),
+          mac_address: addForm.mac_address.trim() || null,
+          os_guess: addForm.os_guess,
+        }),
+      });
+      setAddForm({ device_identity_hint: '', ip_addresses: '', mac_address: '', os_guess: 'unknown' });
+      loadInventory();
+    } catch (err) {
+      setInventoryError(err.message);
+    }
+  };
+
+  const pendingCount = inventory.filter(a => !a.confirmed).length;
+  const visibleInventory = inventory.filter(a => (
+    inventoryFilter === 'ALL' ? true : inventoryFilter === 'PENDING' ? !a.confirmed : a.confirmed
+  ));
+
+  // asset_id is how alerts are keyed (see backend/db/migrations/001_init.sql);
+  // an event has no direct alert relationship, so "is this event
+  // suspicious" is approximated as "does its src or dst IP belong to an
+  // asset that currently has at least one alert".
+  const alertedAssetIds = useMemo(() => new Set(alerts.map((al) => al.asset_id)), [alerts]);
+  const alertedIps = useMemo(() => {
+    const ips = new Set();
+    for (const a of assets) {
+      if (alertedAssetIds.has(a.asset_id)) {
+        for (const ip of a.ip_addresses || []) ips.add(ip);
+      }
+    }
+    return ips;
+  }, [assets, alertedAssetIds]);
+
+  const isSuspiciousEvent = useMemo(
+    () => (e) => alertedIps.has(e.src_ip) || alertedIps.has(e.dst_ip),
+    [alertedIps]
+  );
+
   const activeSensors = useMemo(() => (
-    Array.from(new Set([...agentMeta, ...assets, ...events].map(x => x.sensor_id).filter(Boolean)))
-  ), [agentMeta, assets, events]);
+    Array.from(new Set([...sensors, ...assets, ...events].map(x => x.sensor_id).filter(Boolean)))
+  ), [sensors, assets, events]);
 
   const visibleAssets = assets.filter(a => sensor === 'ALL' || a.sensor_id === sensor);
   const sensorEvents = useMemo(() => events.filter(e => sensor === 'ALL' || e.sensor_id === sensor), [events, sensor]);
-  const suspiciousCount = sensorEvents.filter(e => e.is_suspicious).length;
+  const suspiciousCount = sensorEvents.filter(isSuspiciousEvent).length;
 
   const filteredEvents = sensorEvents.filter(e => (
-    filter === 'ALL' ? true : filter === 'SUSPICIOUS' ? e.is_suspicious : e.application === filter.toLowerCase()
+    filter === 'ALL' ? true : filter === 'SUSPICIOUS' ? isSuspiciousEvent(e) : e.application === filter.toLowerCase()
   ));
 
+  // Sensor fleet table: real fields only (sensor_id, last_seen,
+  // event_count, asset_count, active — see backend/api/sensors.js).
+  // The sensor agent itself has no telemetry endpoint for hostname/
+  // version/CPU/etc, so this page reports what the backend actually
+  // knows rather than fabricating hardware stats.
   const enrichedAgents = useMemo(() => (
-    activeSensors.filter(id => sensor === 'ALL' || id === sensor).map((id, i) => {
-      const meta = agentMeta.find(a => a.sensor_id === id) || {
-        sensor_id: id, hostname: `${id}.local`, version: LATEST_VER, rust_target: "x86_64-linux",
-        os_kernel: "Linux 6.1", interface: `eth${i}`, bpf_filter: "tcp port 104 or 2575",
-        batch_interval_ms: 3000, uptime: "01d 04h", cpu_pct: 2.8, mem_mb: 22.5, dissectors: ["dicom", "hl7"]
+    activeSensors.filter(id => sensor === 'ALL' || id === sensor).map((id) => {
+      const meta = sensors.find(s => s.sensor_id === id) || {
+        sensor_id: id, last_seen: null,
+        event_count: events.filter(e => e.sensor_id === id).length,
+        asset_count: assets.filter(a => a.sensor_id === id).length,
+        active: false
       };
-      return {
-        ...meta,
-        eventCount: events.filter(e => e.sensor_id === id).length,
-        isUpToDate: meta.version === LATEST_VER
-      };
+      const sensorAlerts = alerts.filter(al => assets.some(a => a.sensor_id === id && a.asset_id === al.asset_id));
+      return { ...meta, alertCount: sensorAlerts.length };
     })
-  ), [activeSensors, sensor, agentMeta, events]);
+  ), [activeSensors, sensor, sensors, events, assets, alerts]);
 
   const analytics = useMemo(() => {
     const pCounts = {}, pBytes = {}, sources = {}, buckets = [];
@@ -86,15 +225,16 @@ export default function App() {
       pCounts[proto] = (pCounts[proto] || 0) + 1;
       pBytes[proto] = (pBytes[proto] || 0) + b;
 
-      const ip = e.src_ip || e.src?.split(':')[0] || 'Unknown';
+      const ip = e.src_ip || 'Unknown';
+      const flagged = isSuspiciousEvent(e);
       sources[ip] ??= { ip, name: assets.find(a => a.ip_addresses?.includes(ip))?.device_identity_hint || ip, bytes: 0, flagged: 0 };
       sources[ip].bytes += b;
-      if (e.is_suspicious) sources[ip].flagged += 1;
+      if (flagged) sources[ip].flagged += 1;
 
-      const time = new Date(e["@timestamp"] || e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      const time = new Date(e["@timestamp"]).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
       const slot = buckets.find(x => x.time === time);
-      if (slot) { slot.bytes += b; slot.flagged += e.is_suspicious ? 1 : 0; }
-      else buckets.push({ time, bytes: b, flagged: e.is_suspicious ? 1 : 0 });
+      if (slot) { slot.bytes += b; slot.flagged += flagged ? 1 : 0; }
+      else buckets.push({ time, bytes: b, flagged: flagged ? 1 : 0 });
     });
 
     return {
@@ -105,17 +245,22 @@ export default function App() {
       })).sort((a, b) => b.bytes - a.bytes),
       topTalkers: Object.values(sources).sort((a, b) => b.bytes - a.bytes)
     };
-  }, [sensorEvents, assets]);
+  }, [sensorEvents, assets, isSuspiciousEvent]);
 
   const statsStrip = page === 'AGENTS' ? [
-    { label: "Target Release", val: `v${LATEST_VER}`, sub: "rust-agent" },
-    { label: "Version Drift", val: `${enrichedAgents.filter(a => a.isUpToDate).length} / ${enrichedAgents.length}`, sub: "aligned" },
-    { label: "Transport Auth", val: "ApiKey SHA-256", sub: "enforced", cls: "teal" },
-    { label: "Tap Mode", val: "AF_PACKET", sub: "passive" }
+    { label: "Known Sensors", val: enrichedAgents.length, sub: "reporting" },
+    { label: "Active Sensors", val: enrichedAgents.filter(a => a.active).length, sub: `of ${enrichedAgents.length}` },
+    { label: "Transport Auth", val: "ApiKey", sub: "enforced", cls: "teal" },
+    { label: "Open Alerts", val: alerts.length, sub: alerts.length ? "needs review" : "clear", cls: alerts.length ? "danger" : "" }
+  ] : page === 'INVENTORY' ? [
+    { label: "Total Assets", val: inventory.length, sub: "in inventory" },
+    { label: "Confirmed", val: inventory.filter(a => a.confirmed).length, sub: "vetted" },
+    { label: "Pending Review", val: pendingCount, sub: pendingCount ? "needs confirmation" : "clear", cls: pendingCount ? "danger" : "" },
+    { label: "Manually Added", val: inventory.filter(a => a.source === 'manual').length, sub: "admin-entered" }
   ] : [
-    { label: "Discovered Endpoints", val: visibleAssets.length, sub: "10.0.0.0/24" },
-    { label: "Captured Packets", val: sensorEvents.length, sub: "live stream" },
-    { label: "Payload Volume", val: `${(analytics.totalBytes / 1024).toFixed(1)} KB`, sub: "L7 parsed" },
+    { label: "Discovered Endpoints", val: visibleAssets.length, sub: "assets" },
+    { label: "Captured Packets", val: sensor === 'ALL' ? (stats?.total_events ?? sensorEvents.length) : (enrichedAgents.find(a => a.sensor_id === sensor)?.event_count ?? sensorEvents.length), sub: "total, live" },
+    { label: "Payload Volume", val: `${(analytics.totalBytes / 1024).toFixed(1)} KB`, sub: `last ${sensorEvents.length} pkts` },
     { label: "Policy Violations", val: suspiciousCount, sub: suspiciousCount ? "requires review" : "clear", cls: suspiciousCount ? "danger" : "" }
   ];
 
@@ -129,7 +274,7 @@ export default function App() {
           </div>
 
           <nav style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {[['OVERVIEW', 'Overview', sensorEvents.length], ['ANALYTICS', 'Traffic Analytics'], ['AGENTS', 'Security & Agents', activeSensors.length]].map(([id, label, count]) => (
+            {[['OVERVIEW', 'Overview', sensor === 'ALL' ? (stats?.total_events ?? sensorEvents.length) : sensorEvents.length], ['INVENTORY', 'Asset Inventory', pendingCount || undefined], ['ANALYTICS', 'Traffic Analytics'], ['AGENTS', 'Security & Agents', activeSensors.length]].map(([id, label, count]) => (
               <button key={id} onClick={() => setPage(id)} className={`nav-btn ${page === id ? 'active' : ''}`}>
                 <span>{label}</span>
                 {count !== undefined && <span className="muted" style={{ fontSize: 11 }}>{count}</span>}
@@ -157,7 +302,7 @@ export default function App() {
           <header className="topbar">
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <span className="sub">MedWatch</span><span className="muted">/</span>
-              <strong>{{ OVERVIEW: "Telemetry Stream", ANALYTICS: "Traffic Analytics", AGENTS: "Sensor Fleet" }[page]}</strong>
+              <strong>{{ OVERVIEW: "Telemetry Stream", INVENTORY: "Asset Inventory", ANALYTICS: "Traffic Analytics", AGENTS: "Sensor Fleet" }[page]}</strong>
               {sensor !== 'ALL' && (
                 <>
                   <span className="muted">/</span>
@@ -180,34 +325,120 @@ export default function App() {
             ))}
           </div>
 
-          {/* PAGE 1: AGENTS */}
+          {/* PAGE 1: AGENTS / SECURITY */}
           {page === 'AGENTS' && (
             <div className="panel">
               <table>
                 <thead>
-                  <tr><th>Node</th><th>Binary Version</th><th>OS / Arch</th><th>Interface & Dissectors</th><th>Load</th><th style={{ textAlign: 'right' }}>Uptime</th></tr>
+                  <tr><th>Sensor</th><th>Status</th><th>Events</th><th>Assets</th><th style={{ textAlign: 'right' }}>Last Seen</th></tr>
                 </thead>
                 <tbody>
                   {enrichedAgents.map(ag => (
                     <tr key={ag.sensor_id} className="log-row" onClick={() => setModal({
-                      title: `${ag.sensor_id} / sensor-agent.toml`,
-                      raw: `[agent]\nsensor_id = "${ag.sensor_id}"\nversion = "${ag.version}"\n\n[capture]\ninterface = "${ag.interface.split(' ')[0]}"\nbpf_filter = "${ag.bpf_filter}"\ndissectors = ${JSON.stringify(ag.dissectors)}\n\n[ingest]\nendpoint = "${API_URL}/api/v1"\nauth_header = "Authorization: ApiKey <redacted>"`
+                      title: ag.sensor_id,
+                      raw: JSON.stringify(ag, null, 2)
                     })}>
-                      <td>
-                        <div><span className="teal">● </span><strong>{ag.sensor_id}</strong></div>
-                        <div className="muted" style={{ fontSize: 11, paddingLeft: 12 }}>{ag.hostname}</div>
+                      <td><span className="teal">● </span><strong>{ag.sensor_id}</strong></td>
+                      <td className={ag.active ? 'teal' : 'muted'} style={{ fontSize: 12 }}>{ag.active ? 'active' : 'inactive'}</td>
+                      <td className="sub" style={{ fontSize: 12 }}>{ag.event_count}</td>
+                      <td className="sub" style={{ fontSize: 12 }}>{ag.asset_count}</td>
+                      <td className="sub" style={{ fontSize: 12, textAlign: 'right' }}>
+                        <div>{ag.last_seen ? new Date(ag.last_seen).toLocaleString() : '—'}</div>
+                        {ag.alertCount > 0 && <div className="danger" style={{ fontSize: 11 }}>{ag.alertCount} alert{ag.alertCount === 1 ? '' : 's'}</div>}
                       </td>
-                      <td>
-                        v{ag.version} {!ag.isUpToDate && <span style={{ color: '#f59e0b', fontSize: 11, marginLeft: 6 }}>v{LATEST_VER} avail</span>}
-                      </td>
-                      <td><div>{ag.os_kernel}</div><div className="muted" style={{ fontSize: 11 }}>{ag.rust_target}</div></td>
-                      <td style={{ fontSize: 12 }}><div>{ag.interface}</div><div className="muted" style={{ fontSize: 11 }}>{ag.dissectors.join(" · ").toUpperCase()}</div></td>
-                      <td className="sub" style={{ fontSize: 12 }}>{ag.cpu_pct}% / {ag.mem_mb}MB</td>
-                      <td className="sub" style={{ fontSize: 12, textAlign: 'right' }}><div>{ag.uptime}</div><div className="muted" style={{ fontSize: 11 }}>{ag.eventCount} pkts</div></td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {/* PAGE: ASSET INVENTORY */}
+          {page === 'INVENTORY' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+              {inventoryError && (
+                <div className="panel" style={{ padding: '10px 16px', borderLeft: '2px solid #e5484d' }}>
+                  <span className="danger" style={{ fontSize: 12 }}>{inventoryError}</span>
+                </div>
+              )}
+
+              {/* Manual add form */}
+              <div className="panel" style={{ padding: '16px 20px' }}>
+                <div className="section-hdr" style={{ marginBottom: 10 }}><strong>Add Asset Manually</strong><span className="muted" style={{ fontSize: 11 }}>for devices the agent can't auto-detect</span></div>
+                <form onSubmit={submitManualAsset} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <input
+                    placeholder="Device name (required)"
+                    value={addForm.device_identity_hint}
+                    onChange={e => setAddForm({ ...addForm, device_identity_hint: e.target.value })}
+                    style={{ flex: '1 1 220px', background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '8px 10px', color: '#e6e9ef', fontSize: 12 }}
+                  />
+                  <input
+                    placeholder="IP address(es), comma-separated"
+                    value={addForm.ip_addresses}
+                    onChange={e => setAddForm({ ...addForm, ip_addresses: e.target.value })}
+                    style={{ flex: '1 1 220px', background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '8px 10px', color: '#e6e9ef', fontSize: 12 }}
+                  />
+                  <input
+                    placeholder="MAC address (optional)"
+                    value={addForm.mac_address}
+                    onChange={e => setAddForm({ ...addForm, mac_address: e.target.value })}
+                    style={{ flex: '1 1 160px', background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '8px 10px', color: '#e6e9ef', fontSize: 12 }}
+                  />
+                  <select
+                    value={addForm.os_guess}
+                    onChange={e => setAddForm({ ...addForm, os_guess: e.target.value })}
+                    style={{ background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '8px 10px', color: '#e6e9ef', fontSize: 12 }}
+                  >
+                    {['unknown', 'windows', 'linux', 'bsd', 'network-appliance', 'embedded-or-iot'].map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                  <button type="submit" className="pill-btn active" style={{ fontSize: 12, padding: '8px 16px' }}>Add Asset</button>
+                </form>
+              </div>
+
+              <div className="section-hdr">
+                <strong>Inventory</strong>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {[['PENDING', `Pending (${pendingCount})`], ['CONFIRMED', 'Confirmed'], ['ALL', 'All']].map(([id, label]) => (
+                    <button key={id} onClick={() => setInventoryFilter(id)} className={`pill-btn ${inventoryFilter === id ? 'active' : ''}`} style={{ fontSize: 11 }}>{label}</button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="panel">
+                <table>
+                  <thead>
+                    <tr><th>Device</th><th>Source</th><th>IP / MAC</th><th>OS Guess</th><th>Status</th><th style={{ textAlign: 'right' }}>Actions</th></tr>
+                  </thead>
+                  <tbody>
+                    {visibleInventory.map(a => (
+                      <tr key={a.asset_id} className="log-row">
+                        <td onClick={() => setModal({ title: a.asset_id, raw: JSON.stringify(a, null, 2) })}>
+                          <strong>{a.device_identity_hint || a.asset_id}</strong>
+                        </td>
+                        <td className="sub" style={{ fontSize: 12 }}>
+                          <span className={a.source === 'manual' ? 'teal' : 'muted'}>{a.source === 'manual' ? 'Manual' : 'Auto-detected'}</span>
+                        </td>
+                        <td className="sub" style={{ fontSize: 12 }}>{[...(a.ip_addresses || []), a.mac_address].filter(Boolean).join(', ') || '—'}</td>
+                        <td className="sub" style={{ fontSize: 12 }}>{a.os_guess}</td>
+                        <td style={{ fontSize: 11.5 }}>
+                          <span className={a.confirmed ? 'teal' : 'danger'}>{a.confirmed ? 'Confirmed' : 'Pending review'}</span>
+                        </td>
+                        <td style={{ textAlign: 'right' }}>
+                          <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                            {!a.confirmed && (
+                              <button onClick={() => confirmAsset(a.asset_id)} className="pill-btn active" style={{ fontSize: 11 }}>Confirm</button>
+                            )}
+                            <button onClick={() => removeAsset(a.asset_id)} className="pill-btn" style={{ fontSize: 11 }}>Remove</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                    {visibleInventory.length === 0 && (
+                      <tr><td colSpan={6} className="muted" style={{ fontSize: 12, textAlign: 'center', padding: 20 }}>No assets in this view.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
 
@@ -269,18 +500,6 @@ export default function App() {
           {/* PAGE 3: OVERVIEW */}
           {page === 'OVERVIEW' && (
             <>
-              <div className="section-hdr"><strong>Clinical Asset Inventory</strong><span className="muted" style={{ fontSize: 11 }}>{visibleAssets.length} active</span></div>
-              <div className="asset-grid">
-                {visibleAssets.map(a => (
-                  <div key={a.asset_id} className="asset-cell">
-                    <div className="section-hdr" style={{ marginBottom: 6 }}><strong>{a.device_identity_hint || a.asset_id}</strong><span className="muted" style={{ fontSize: 11 }}>{a.os_guess}</span></div>
-                    <div className="sub" style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                      <span>{a.ip_addresses?.join(", ")}</span><span className="muted" style={{ fontSize: 11 }}>{a.observed_protocols?.join(" · ").toUpperCase()}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
               <div className="section-hdr">
                 <strong>Packet Stream</strong>
                 <div style={{ display: 'flex', gap: 4 }}>
@@ -295,15 +514,16 @@ export default function App() {
                   <thead><tr><th>State</th><th>Timestamp</th><th>Sensor</th><th>Source → Destination</th><th>Proto</th><th>Decoded Payload</th></tr></thead>
                   <tbody>
                     {filteredEvents.map(e => {
-                      const flow = `${e.src || `${e.src_ip}:${e.src_port ?? ''}`} → ${e.dst || `${e.dst_ip}:${e.dst_port ?? ''}`}`;
-                      const meta = e.protocol_metadata || e.metadata;
+                      const flow = `${e.src_ip}:${e.src_port ?? ''} → ${e.dst_ip}:${e.dst_port ?? ''}`;
+                      const flagged = isSuspiciousEvent(e);
+                      const meta = e.protocol_metadata;
                       return (
-                        <tr key={e.event_id} className={`log-row ${e.is_suspicious ? 'flagged' : ''}`} onClick={() => setModal({
+                        <tr key={e.event_id} className={`log-row ${flagged ? 'flagged' : ''}`} onClick={() => setModal({
                           title: `Packet Inspection (${e.event_id})`,
                           raw: `Sensor: ${e.sensor_id}\nFlow:   ${flow}\nBytes:  ${e.length_bytes || 512} B\n\n${JSON.stringify(meta, null, 2)}`
                         })}>
-                          <td className={e.is_suspicious ? 'danger' : 'sub'} style={{ fontSize: 11.5, borderLeft: e.is_suspicious ? '2px solid #e5484d' : 'none' }}>{e.is_suspicious ? 'Flagged' : 'Pass'}</td>
-                          <td className="muted" style={{ fontSize: 12 }}>{new Date(e["@timestamp"] || e.timestamp).toLocaleTimeString([], { hour12: false })}</td>
+                          <td className={flagged ? 'danger' : 'sub'} style={{ fontSize: 11.5, borderLeft: flagged ? '2px solid #e5484d' : 'none' }}>{flagged ? 'Flagged' : 'Pass'}</td>
+                          <td className="muted" style={{ fontSize: 12 }}>{new Date(e["@timestamp"]).toLocaleTimeString([], { hour12: false })}</td>
                           <td className="sub" style={{ fontSize: 12 }}>{e.sensor_id}</td>
                           <td style={{ fontSize: 12 }}>{flow}</td>
                           <td className="teal" style={{ fontSize: 11.5 }}>{e.application?.toUpperCase()}</td>

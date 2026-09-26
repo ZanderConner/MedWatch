@@ -95,5 +95,21 @@ test('auth: ingest and admin writes require ApiKey, reads do not', async () => {
       headers: { Authorization: 'ApiKey test-key' },
     });
     assert.equal(res.status, 200);
+
+    // Admin asset-inventory routes require auth for every verb too.
+    res = await fetch(`${base}/api/v1/admin/assets`);
+    assert.equal(res.status, 401);
+
+    res = await fetch(`${base}/api/v1/admin/assets`, {
+      headers: { Authorization: 'ApiKey test-key' },
+    });
+    assert.equal(res.status, 200);
+
+    res = await fetch(`${base}/api/v1/admin/assets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_identity_hint: 'no-auth-test' }),
+    });
+    assert.equal(res.status, 401, 'POST /admin/assets should require auth');
   });
 });

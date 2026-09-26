@@ -2,7 +2,7 @@
   <id>b6a1b1d0-1a2b-4c3d-9e4f-000000000001</id>
   <nextMetaDataId>2</nextMetaDataId>
   <name>Hematology Orders to Analyzer</name>
-  <description>Receives lab orders on 6662 and forwards them via MLLP to the hematology analyzer simulator on 10.20.50.22:6660.</description>
+  <description>Receives lab orders on 6662 and forwards them via MLLP to the hematology analyzer simulator on 10.20.80.22:6660.</description>
   <revision>1</revision>
   <sourceConnector version="4.5.2">
     <metaDataId>0</metaDataId>
@@ -157,7 +157,7 @@
           <maxRetries>2</maxRetries>
         </transmissionModeProperties>
         <serverMode>false</serverMode>
-        <remoteAddress>10.20.50.22</remoteAddress>
+        <remoteAddress>10.20.80.22</remoteAddress>
         <remotePort>6660</remotePort>
         <overrideLocalBinding>false</overrideLocalBinding>
         <localAddress>0.0.0.0</localAddress>

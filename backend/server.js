@@ -2,6 +2,7 @@
 // one Express app for hackathon simplicity (split into services later if
 // there's ever a reason to scale them independently).
 const express = require('express');
+const cors = require('cors');
 const { config } = require('./shared/config');
 const { migrate } = require('./db/migrate');
 const ingestRoutes = require('./ingest/routes');
@@ -15,6 +16,12 @@ const { runCorrelation } = require('./correlation/rules');
 migrate();
 
 const app = express();
+// The frontend (Vite dev server / a static build served from another
+// origin) fetches this API directly from the browser — CORS must be
+// open for the read endpoints or every frontend fetch() silently fails
+// with a CORS error the frontend can't distinguish from a network
+// failure. Hackathon-simple: allow any origin, no credentials.
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));

@@ -145,8 +145,8 @@ services:
     networks:
       hl7_net:
         ipv4_address: 10.20.20.10
-      orthanc_private_net:
-        ipv4_address: 10.20.50.12
+      lab_net:
+        ipv4_address: 10.20.80.12
     volumes:
       - mirth-appdata:/opt/connect/appdata
     restart: unless-stopped
@@ -186,7 +186,8 @@ services:
           "DicomPort": 4242,
           "HttpPort": 8042,
           "DicomModalities": {
-            "dicom-simulator": ["DICOMSIM", "10.20.50.21", 104]
+            "ct-simulator": ["CTSIM", "10.20.70.21", 104],
+            "mri-simulator": ["MRISIM", "10.20.70.22", 104]
           }
         }
     depends_on:
@@ -204,8 +205,8 @@ services:
     networks:
       pacs_net:
         ipv4_address: 10.20.30.10
-      orthanc_private_net:
-        ipv4_address: 10.20.50.10
+      imaging_net:
+        ipv4_address: 10.20.70.10
     volumes:
       - orthanc-db:/var/lib/orthanc/db
     restart: unless-stopped
@@ -225,17 +226,21 @@ services:
     command: ["/usr/local/bin/route-default.sh"]
     restart: unless-stopped
 
-  dicom-simulator:
+  # Imaging subnet (imaging_net): two independent DICOM modalities (a CT
+  # scanner and an MRI machine) both sending studies to the same Orthanc
+  # PACS — models a real radiology department with more than one modality
+  # on the wire, not just one, for the distributed-agent demo.
+  ct-simulator:
     build:
       context: ./simulators
-    container_name: dicom-simulator
-    hostname: dicom-simulator
+    container_name: ct-simulator
+    hostname: ct-simulator
     environment:
-      LAB_ROLE: dicom-simulator
+      LAB_ROLE: ct-simulator
       MODALITY: CT
       DEVICE_MODALITY_LABEL: CT
-      AET: DICOMSIM
-      TARGET_HOST: 10.20.50.10
+      AET: CTSIM
+      TARGET_HOST: 10.20.70.10
       TARGET_PORT: 4242
       TARGET_AET: ORTHANC
       DICOM_LISTEN_PORT: 104
@@ -249,17 +254,134 @@ services:
       TZ: America/New_York
       JITTER_MIN_SECONDS: 5
       JITTER_MAX_SECONDS: 20
-      ACCESSION_PREFIX: MED
+      ACCESSION_PREFIX: CT
       HOSPITAL_NAME: MedSim Medical Center
       HOSPITAL_ADDRESS: 100 Simulation Way
     networks:
-      orthanc_private_net:
-        ipv4_address: 10.20.50.21
+      imaging_net:
+        ipv4_address: 10.20.70.21
     volumes:
       - tcia-dicoms:/tcia_data:ro
       - ./simulators/patients.csv:/app/patients.csv:ro
     restart: unless-stopped
 
+  mri-simulator:
+    build:
+      context: ./simulators
+    container_name: mri-simulator
+    hostname: mri-simulator
+    environment:
+      LAB_ROLE: mri-simulator
+      MODALITY: MR
+      DEVICE_MODALITY_LABEL: MR
+      AET: MRISIM
+      TARGET_HOST: 10.20.70.10
+      TARGET_PORT: 4242
+      TARGET_AET: ORTHANC
+      DICOM_LISTEN_PORT: 104
+      PATIENT_POOL_CSV: /app/patients.csv
+      TCIA_DATA_DIR: /tcia_data/MR
+      TCIA_WAIT_MINUTES: 0
+      SEND_INTERVAL: 150
+      STUDIES_PER_BURST: 1
+      WORK_HOURS_START: "00:00"
+      WORK_HOURS_END: "00:00"
+      TZ: America/New_York
+      JITTER_MIN_SECONDS: 5
+      JITTER_MAX_SECONDS: 20
+      ACCESSION_PREFIX: MR
+      HOSPITAL_NAME: MedSim Medical Center
+      HOSPITAL_ADDRESS: 100 Simulation Way
+    networks:
+      imaging_net:
+        ipv4_address: 10.20.70.22
+    volumes:
+      - tcia-dicoms:/tcia_data:ro
+      - ./simulators/patients.csv:/app/patients.csv:ro
+    restart: unless-stopped
+
+  # Radiology workstation: a normal clinical workstation on imaging_net
+  # that generates ordinary background HTTP(S) traffic against Orthanc,
+  # Mirth, and OpenEMR — the "someone browsing the PACS/portal" traffic a
+  # real radiology floor produces alongside its DICOM device traffic.
+  # Multi-homed onto hl7_net/emr_net purely so it can actually reach
+  # Mirth's/OpenEMR's web ports (those live on internal bridge networks
+  # this box isn't on by default) — not itself meant to look suspicious.
+  radiology-workstation:
+    build:
+      context: ./radiology-workstation
+    container_name: radiology-workstation
+    hostname: radiology-workstation
+    command:
+      - python
+      - -u
+      - traffic_gen.py
+      - --orthanc-url
+      - http://10.20.70.10:8042
+      - --mirth-url
+      - https://10.20.20.10:8443
+      - --openemr-url
+      - https://10.20.10.10
+      - --min-interval
+      - "15"
+      - --max-interval
+      - "45"
+    networks:
+      imaging_net:
+        ipv4_address: 10.20.70.30
+      hl7_net:
+        ipv4_address: 10.20.20.31
+      emr_net:
+        ipv4_address: 10.20.10.31
+    restart: unless-stopped
+
+  # Red-team box: deliberately rogue DICOM/HL7 traffic to trip
+  # unrecognized_dicom_initiator / unrecognized_hl7_sender in
+  # backend/correlation/rules.js, for demoing policy-violation
+  # detection. Kept as its own standalone container/codebase per
+  # cyber-range-device-simulation skill guidance (never bundled into
+  # the target simulators). Multi-homed on imaging_net (to reach
+  # Orthanc's DICOM port) and lab_net (to reach Mirth's HL7 listener).
+  # ssh exposed only within these internal networks, for live demo
+  # control (see demo/red-team-box/entrypoint.sh) — never published to
+  # the host.
+  red-team-box:
+    build:
+      context: ./red-team-box
+    container_name: red-team-box
+    hostname: red-team-box
+    environment:
+      DICOM_HOST: "10.20.70.10"
+      DICOM_PORT: "4242"
+    command:
+      - --dicom-host
+      - "10.20.70.10"
+      - --dicom-port
+      - "4242"
+      - --dicom-ae
+      - ROGUEWS
+      - --hl7-host
+      - "10.20.80.12"
+      - --hl7-port
+      - "6661"
+      - --hl7-sending-app
+      - UNKNOWNLIS
+      - --min-interval
+      - "30"
+      - --max-interval
+      - "90"
+    networks:
+      imaging_net:
+        ipv4_address: 10.20.70.31
+      lab_net:
+        ipv4_address: 10.20.80.31
+    restart: unless-stopped
+
+  # Lab subnet (lab_net): the hematology analyzer, sending CBC results
+  # to Mirth's lab_net-side interface. Separate subnet from imaging_net
+  # so this demo has two genuinely distinct OT/clinical subnets, each
+  # observed by its own dedicated monitoring-agent (see
+  # monitoring-agent-imaging / monitoring-agent-lab below).
   hl7-simulator:
     build:
       context: ./hematology-sim
@@ -274,7 +396,7 @@ services:
       - --listen-port
       - "6660"
       - --send-host
-      - 10.20.50.12
+      - 10.20.80.12
       - --send-port
       - "6661"
       - --min-delay
@@ -290,8 +412,49 @@ services:
       - --receiving-facility
       - MEDSIM
     networks:
-      orthanc_private_net:
-        ipv4_address: 10.20.50.22
+      lab_net:
+        ipv4_address: 10.20.80.22
+    restart: unless-stopped
+
+  # Second lab analyzer, same image/protocol as hl7-simulator above but a
+  # distinct AE/sending-app identity ("HEMA-4000") and a much shorter
+  # send interval — exists purely to add more baseline HL7 traffic
+  # volume to the lab subnet, as if a second bay's analyzer came online.
+  # Note: KNOWN_GOOD_HL7_SENDING_APPS in backend/correlation/rules.js
+  # already includes "HEMA-4000" so this device won't spuriously trip
+  # unrecognized_hl7_sender.
+  hl7-simulator-2:
+    build:
+      context: ./hematology-sim
+    container_name: hl7-simulator-2
+    hostname: hl7-simulator-2
+    command:
+      - python
+      - -u
+      - analyzer.py
+      - --listen-host
+      - 0.0.0.0
+      - --listen-port
+      - "6660"
+      - --send-host
+      - 10.20.80.12
+      - --send-port
+      - "6661"
+      - --min-delay
+      - "3"
+      - --max-delay
+      - "9"
+      - --sending-app
+      - HEMA-4000
+      - --sending-facility
+      - HEMATOLOGY
+      - --receiving-app
+      - MIRTH
+      - --receiving-facility
+      - MEDSIM
+    networks:
+      lab_net:
+        ipv4_address: 10.20.80.23
     restart: unless-stopped
 
   hl7-order-generator:
@@ -331,51 +494,63 @@ services:
       - ./simulators/patients.csv:/app/patients.csv:ro
     restart: unless-stopped
 
-  monitoring-agent:
+  # Two dedicated sensors, one per clinical/OT subnet, demonstrating a
+  # distributed multi-agent deployment (each subnet has its own
+  # observation point, not one sensor trying to see everything from a
+  # single vantage point — closer to how a real multi-site hospital
+  # network would be instrumented).
+  monitoring-agent-imaging:
     build:
       context: ..
       dockerfile: agents/sensor-agent/Dockerfile
-    container_name: monitoring-agent
-    hostname: monitoring-agent
+    container_name: monitoring-agent-imaging
+    hostname: monitoring-agent-imaging
     cap_add:
       - NET_ADMIN
       - NET_RAW
     environment:
-      LAB_ROLE: monitoring-agent
-    # Real MedWatch sensor agent (agents/sensor-agent), shipping to the
-    # real backend (backend/, built via backend/Dockerfile, container
-    # "siem" below on agent_siem_net) — --dry-run is OFF now that the
-    # backend actually exists and implements POST /api/v1/events and
-    # /api/v1/assets. api_key in sensor-agent.toml must match this
-    # backend's MEDWATCH_API_KEY env var below.
-    #
-    # NOTE: bridge-attached like this (interface "any" on its own veth),
-    # the agent only sees ITS OWN traffic plus broadcast/multicast — a
-    # Docker bridge is a learning switch, not a hub, so unicast frames
-    # between two OTHER containers never reach this one even in
-    # promiscuous mode. Verified empirically. For full-traffic validation
-    # (seeing dicom-simulator<->orthanc, mirth<->hl7-simulator, etc) use
-    # the bridge-tap technique in
-    # demo/range/monitoring-agent/TAP-VALIDATION.md instead. A real
-    # OT-subnet deployment needs an actual SPAN/mirror port or network tap
-    # on the physical switch for the same reason.
-    command:
-      [
-        "--config",
-        "/etc/medwatch/sensor-agent.toml",
-        "--interface",
-        "any",
-      ]
+      LAB_ROLE: monitoring-agent-imaging
+      # Compose prefixes network names with the project name ("medsim-range",
+      # see the `name:` key at the top of this file) — this must match
+      # exactly what `docker network ls` shows for imaging_net.
+      TARGET_NETWORK: medsim-range_imaging_net
+    # Runs with --network host and taps the imaging_net bridge device
+    # directly (resolved at startup by resolve-bridge-and-run.sh via the
+    # mounted Docker socket) — the Docker-native SPAN/tap equivalent
+    # documented in demo/range/monitoring-agent/TAP-VALIDATION.md. A
+    # normal bridge-attached container only sees its own traffic (a
+    # Docker bridge is a learning switch, not a hub), so this is
+    # required to see real ct-simulator/mri-simulator<->orthanc traffic.
+    network_mode: host
+    command: ["--config", "/etc/medwatch/sensor-agent-imaging.toml"]
     depends_on:
       backend:
         condition: service_started
     volumes:
-      - ./range/monitoring-agent/sensor-agent.toml:/etc/medwatch/sensor-agent.toml:ro
-    networks:
-      orthanc_private_net:
-        ipv4_address: 10.20.50.23
-      agent_siem_net:
-        ipv4_address: 10.20.60.20
+      - ./range/monitoring-agent/sensor-agent-imaging.toml:/etc/medwatch/sensor-agent-imaging.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  monitoring-agent-lab:
+    build:
+      context: ..
+      dockerfile: agents/sensor-agent/Dockerfile
+    container_name: monitoring-agent-lab
+    hostname: monitoring-agent-lab
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      LAB_ROLE: monitoring-agent-lab
+      TARGET_NETWORK: medsim-range_lab_net
+    network_mode: host
+    command: ["--config", "/etc/medwatch/sensor-agent-lab.toml"]
+    depends_on:
+      backend:
+        condition: service_started
+    volumes:
+      - ./range/monitoring-agent/sensor-agent-lab.toml:/etc/medwatch/sensor-agent-lab.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     restart: unless-stopped
 
   backend:
@@ -387,7 +562,15 @@ services:
     environment:
       PORT: "8080"
       MEDWATCH_API_KEY: change-me
-      MEDWATCH_DB_PATH: /app/data/medwatch.sqlite
+      # Demo range is meant to start EMPTY every time it's spun up — the
+      # whole point of the Asset Inventory page is showing the
+      # discover -> confirm workflow live, not replaying yesterday's
+      # state. ":memory:" means every `docker compose down && up` (or a
+      # plain container restart) gets a clean slate; nothing persists to
+      # disk. If you ever want a persistent demo instance instead, set
+      # this back to a real path and re-add the siem-data volume mount
+      # below.
+      MEDWATCH_DB_PATH: ":memory:"
     # Real MedWatch backend (backend/), replacing the old placeholder
     # "siem" sleep-infinity container. Kept the container_name/hostname
     # "siem" and the same network/IP/port layout so nothing else in the
@@ -404,8 +587,31 @@ services:
         ipv4_address: 10.20.40.10
       agent_siem_net:
         ipv4_address: 10.20.60.10
-    volumes:
-      - siem-data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+      args:
+        # Browser-side fetches hit the backend on the HOST's published
+        # port (9000, see the backend service above), not the internal
+        # container port — the browser runs outside the compose network.
+        VITE_API_URL: http://localhost:9000
+        # Must match the backend service's MEDWATCH_API_KEY below — used
+        # only by the Asset Inventory page's write actions (manual add /
+        # confirm / delete).
+        VITE_ADMIN_API_KEY: change-me
+    container_name: frontend
+    hostname: frontend
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "5173:80"
+    networks:
+      lone_linux_net:
+        ipv4_address: 10.20.40.11
     restart: unless-stopped
 
   openemr-seed:
@@ -494,13 +700,20 @@ networks:
       config:
         - subnet: 10.20.40.0/24
           gateway: 10.20.40.254
-  orthanc_private_net:
+  imaging_net:
     driver: bridge
     internal: true
     ipam:
       config:
-        - subnet: 10.20.50.0/24
-          gateway: 10.20.50.254
+        - subnet: 10.20.70.0/24
+          gateway: 10.20.70.254
+  lab_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.80.0/24
+          gateway: 10.20.80.254
   agent_siem_net:
     driver: bridge
     internal: true
@@ -517,4 +730,3 @@ volumes:
   mirth-appdata:
   orthanc-db:
   tcia-dicoms:
-  siem-data:

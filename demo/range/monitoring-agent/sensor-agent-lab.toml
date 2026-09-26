@@ -1,0 +1,33 @@
+# MedWatch sensor-agent config for the demo range's LAB subnet
+# monitoring agent (see monitoring-agent-lab in
+# demo/docker-compose.yml) — observes the hl7-simulator (hematology
+# analyzer) <-> mirth HL7 traffic on lab_net.
+#
+# `interface` below is a placeholder: the container's entrypoint
+# (agents/sensor-agent/resolve-bridge-and-run.sh) resolves lab_net's
+# actual host bridge device name at startup (via the Docker socket) and
+# overrides it with --interface, since a compose project's bridge
+# device name isn't known ahead of time. See TAP-VALIDATION.md for why
+# a normal bridge-attached container can't see this traffic at all —
+# a Docker bridge is a learning switch, not a hub.
+
+[sensor]
+id = "sensor-lab"
+site = "medsim-demo-range-lab"
+
+[capture]
+interface = "placeholder-overridden-at-runtime"
+snaplen = 262144
+promiscuous = true
+bpf_filter = "not port 22"
+asset_flush_interval_secs = 60
+# hl7-simulator <-> mirth runs on 6660/6661 (see hl7-simulator's
+# --listen-port/--send-port), not the IANA-standard 2575.
+hl7_ports = [6660, 6661]
+
+[backend]
+url = "http://127.0.0.1:9000"
+api_key = "change-me"
+batch_size = 500
+flush_interval_secs = 5
+verify_tls = false
