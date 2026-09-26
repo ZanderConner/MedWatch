@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+/backend/node_modules
+/backend/data
+/backend/.env
+/backend/*.sqlite
+/backend/*.sqlite-journal

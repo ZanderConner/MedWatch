@@ -1,0 +1,15 @@
+[project]
+name = "hematology-hl7-simulator"
+version = "1.0.0"
+description = "HL7 MLLP hematology analyzer simulator"
+requires-python = ">=3.12"
+dependencies = [
+    "hl7>=0.4.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+compile-bytecode = true

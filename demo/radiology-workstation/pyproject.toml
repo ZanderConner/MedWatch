@@ -1,0 +1,15 @@
+[project]
+name = "radiology-workstation-traffic-gen"
+version = "1.0.0"
+description = "Benign background HTTP/HTTPS traffic generator (Orthanc/Mirth/OpenEMR)"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+compile-bytecode = true
