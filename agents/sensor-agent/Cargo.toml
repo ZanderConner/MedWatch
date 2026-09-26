@@ -1,0 +1,35 @@
+[package]
+name = "medwatch-sensor-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Passive network sensor: capture, asset discovery, fingerprinting, ships events to a backend ingest API."
+
+[[bin]]
+name = "medwatch-sensor"
+path = "src/main.rs"
+
+[dependencies]
+medwatch-fingerprinting = { path = "../fingerprinting" }
+medwatch-proto-dicom = { path = "../protocol-parsers/dicom" }
+medwatch-proto-hl7 = { path = "../protocol-parsers/hl7" }
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+pcap = "1"
+etherparse = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+hostname = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
