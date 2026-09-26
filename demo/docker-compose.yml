@@ -333,7 +333,8 @@ services:
 
   monitoring-agent:
     build:
-      context: ./range/host
+      context: ..
+      dockerfile: agents/sensor-agent/Dockerfile
     container_name: monitoring-agent
     hostname: monitoring-agent
     cap_add:
@@ -341,11 +342,32 @@ services:
       - NET_RAW
     environment:
       LAB_ROLE: monitoring-agent
-    # Blank placeholder: holds this container's hostname/IPs/network
-    # attachments in the range topology for the real asset/monitoring agent,
-    # not yet implemented. Replace this command with the real agent's
-    # entrypoint when it's integrated.
-    command: ["sleep", "infinity"]
+    # Real MedWatch sensor agent (agents/sensor-agent). --dry-run because
+    # the siem service doesn't expose a real ingest API yet (backend/ is
+    # still an empty scaffold) — the agent captures/parses/fingerprints
+    # for real and logs counts instead of POSTing. Drop --dry-run once
+    # POST /api/v1/events and /api/v1/assets exist on siem:8080.
+    #
+    # NOTE: bridge-attached like this (interface "any" on its own veth),
+    # the agent only sees ITS OWN traffic plus broadcast/multicast — a
+    # Docker bridge is a learning switch, not a hub, so unicast frames
+    # between two OTHER containers never reach this one even in
+    # promiscuous mode. Verified empirically. For full-traffic validation
+    # (seeing dicom-simulator<->orthanc, mirth<->hl7-simulator, etc) use
+    # the bridge-tap technique in
+    # demo/range/monitoring-agent/TAP-VALIDATION.md instead. A real
+    # OT-subnet deployment needs an actual SPAN/mirror port or network tap
+    # on the physical switch for the same reason.
+    command:
+      [
+        "--config",
+        "/etc/medwatch/sensor-agent.toml",
+        "--interface",
+        "any",
+        "--dry-run",
+      ]
+    volumes:
+      - ./range/monitoring-agent/sensor-agent.toml:/etc/medwatch/sensor-agent.toml:ro
     networks:
       orthanc_private_net:
         ipv4_address: 10.20.50.23

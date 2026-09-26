@@ -60,13 +60,38 @@ pub fn parse_associate_rq(buf: &[u8]) -> Result<AssociateRq, DicomParseError> {
     })
 }
 
-/// Returns true if `buf` opens with an A-ASSOCIATE-RQ or -AC PDU type byte,
-/// used by the sensor's protocol dispatcher for fast port+content sniffing.
+/// Returns true if `buf` looks like the start of an A-ASSOCIATE-RQ or -AC
+/// PDU, used by the sensor's protocol dispatcher for fast content sniffing
+/// on non-standard ports. Checks more than just the first byte: PDU type
+/// is one byte in a space of 256 values, so a bare `buf[0] == 0x01` check
+/// alone produces frequent false positives on arbitrary non-DICOM traffic
+/// (confirmed in range validation — ICMPv6/NDP payloads that happen to
+/// start with 0x01 were being tagged as DICOM). Also validates the
+/// reserved byte, the two reserved bytes at the protocol-version offset,
+/// and that the declared PDU length is internally plausible.
 pub fn looks_like_dicom(buf: &[u8]) -> bool {
-    matches!(
-        buf.first(),
-        Some(&PDU_TYPE_ASSOCIATE_RQ) | Some(&PDU_TYPE_ASSOCIATE_AC)
-    )
+    // Fixed header layout (PS3.8 §9.3.2/9.3.3): byte 0 PDU type, byte 1
+    // reserved (must be 0x00), bytes 2..6 PDU length (u32 BE, describes
+    // bytes following the 6-byte header), bytes 8..10 reserved (0x0000)
+    // for both A-ASSOCIATE-RQ and -AC.
+    const MIN_SNIFF_LEN: usize = 10;
+    if buf.len() < MIN_SNIFF_LEN {
+        return false;
+    }
+    let is_associate_type = matches!(buf[0], PDU_TYPE_ASSOCIATE_RQ | PDU_TYPE_ASSOCIATE_AC);
+    if !is_associate_type {
+        return false;
+    }
+    let reserved_byte_1 = buf[1] == 0x00;
+    let reserved_bytes_8_9 = buf[8] == 0x00 && buf[9] == 0x00;
+    let declared_len = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+    // A real A-ASSOCIATE PDU body is at least ~68 bytes (protocol version +
+    // both AE titles + reserved) and DICOM PDUs are capped well under 1MB
+    // in practice; this range rules out both all-zero and wildly-implausible
+    // "length" fields that random payload bytes tend to produce.
+    let plausible_length = (2..1_000_000).contains(&declared_len);
+
+    reserved_byte_1 && reserved_bytes_8_9 && plausible_length
 }
 
 fn extract_ae_title(field: &[u8]) -> Result<String, DicomParseError> {
@@ -130,10 +155,28 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_dicom_matches_rq_and_ac() {
-        assert!(looks_like_dicom(&[0x01, 0, 0, 0]));
-        assert!(looks_like_dicom(&[0x02, 0, 0, 0]));
-        assert!(!looks_like_dicom(&[0x50, 0, 0, 0]));
+    fn looks_like_dicom_matches_real_associate_headers() {
+        let rq = build_associate_rq("A", "B");
+        assert!(looks_like_dicom(&rq));
+        let mut ac = rq.clone();
+        ac[0] = PDU_TYPE_ASSOCIATE_AC;
+        assert!(looks_like_dicom(&ac));
+    }
+
+    #[test]
+    fn looks_like_dicom_rejects_wrong_type_or_short_buffer() {
+        assert!(!looks_like_dicom(&[0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!looks_like_dicom(&[0x01, 0, 0, 0]));
         assert!(!looks_like_dicom(&[]));
+    }
+
+    #[test]
+    fn looks_like_dicom_rejects_non_dicom_byte_that_starts_with_pdu_type() {
+        // Real-world false positive found via range validation: an
+        // ICMPv6/NDP payload whose first byte happens to be 0x01 but
+        // whose "reserved" bytes and length field don't match any real
+        // DICOM PDU.
+        let icmpv6_like = [0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x99, 0x00];
+        assert!(!looks_like_dicom(&icmpv6_like));
     }
 }

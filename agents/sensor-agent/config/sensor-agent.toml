@@ -8,7 +8,10 @@
 site = "unset-site"
 
 [capture]
-# Linux: interface name, e.g. "eth0". Run with --list-interfaces to see options.
+# Linux: interface name, e.g. "eth0", or "any" to capture on every
+# interface (useful when the host has more than one NIC and you're not
+# sure which one carries the traffic you care about). Run with
+# --list-interfaces to see options.
 # Windows: Npcap device name as reported by --list-interfaces (looks like
 # "\Device\NPF_{GUID}") — copy it exactly from that output.
 interface = "eth0"
