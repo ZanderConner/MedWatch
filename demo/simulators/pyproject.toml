@@ -1,0 +1,21 @@
+[project]
+name = "dicom-simulator"
+version = "1.0.0"
+description = "AU SCCS MOCKSOCK DICOM Sim"
+requires-python = ">=3.12"
+dependencies = [
+    "pydicom>=2.4.4",
+    "pynetdicom>=2.0.2",
+    "numpy>=1.26.4",
+    "pylibjpeg>=2.0.1",
+    "pylibjpeg-libjpeg>=2.2.0",
+    "pylibjpeg-openjpeg>=2.3.0",
+    "tzdata>=2024.1",        # zoneinfo tzdata for non-Linux containers
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+compile-bytecode = true
