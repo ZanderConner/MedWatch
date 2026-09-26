@@ -49,8 +49,10 @@ app.listen(config.port, () => {
   console.log(`[server] MedWatch backend listening on :${config.port}`);
 });
 
-// Run a correlation pass every 30s so alerts stay reasonably fresh
-// without the frontend having to poll POST /api/v1/correlate itself.
+// Run a correlation pass every few seconds so alerts (and their
+// clearance when an asset gets confirmed) stay effectively real-time
+// for the demo, without the frontend having to poll POST
+// /api/v1/correlate itself.
 setInterval(() => {
   try {
     const newAlerts = runCorrelation();
@@ -60,4 +62,4 @@ setInterval(() => {
   } catch (err) {
     console.error('[correlation] periodic pass failed:', err);
   }
-}, 30_000);
+}, 3_000);

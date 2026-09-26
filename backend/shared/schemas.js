@@ -14,6 +14,16 @@ const APPLICATION_PROTOCOLS = [
   'ssh',
   'rdp',
   'smb',
+  'arp',
+  'icmp',
+  'ntp',
+  'snmp',
+  'mdns',
+  'ldap',
+  'syslog',
+  'ftp',
+  'telnet',
+  'smtp',
   'unknown',
 ];
 const OS_GUESSES = [

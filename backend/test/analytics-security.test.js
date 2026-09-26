@@ -43,14 +43,14 @@ test('analytics + security aggregations', () => {
   ]);
 
   // --- analytics ---
-  const distribution = protocolDistribution(db);
+  const distribution = protocolDistribution({}, db);
   const dicom = distribution.find((d) => d.application === 'dicom');
   assert.equal(dicom.count, 2);
 
-  const transport = transportDistribution(db);
+  const transport = transportDistribution({}, db);
   assert.ok(transport.some((t) => t.transport === 'tcp' && t.count === 3));
 
-  const os = osDistribution(db);
+  const os = osDistribution({}, db);
   assert.ok(os.some((o) => o.os_guess === 'embedded-or-iot' && o.count === 1));
   assert.ok(os.some((o) => o.os_guess === 'linux' && o.count === 1));
 
@@ -65,6 +65,18 @@ test('analytics + security aggregations', () => {
   const totalBucketed = ts.buckets.reduce((sum, b) => sum + b.count, 0);
   assert.equal(totalBucketed, 4);
 
+  // --- sensor_id scoping (new, multi-sensor distributed-agent demo) ---
+  insertEvents([
+    { event_id: 'a0000000-0000-0000-0000-000000000005', sensor_id: 's2', '@timestamp': iso(0), src_ip: '10.0.0.5', dst_ip: '10.0.0.9', transport: 'tcp', application: 'dicom', length_bytes: 10 },
+  ]);
+  const s1Only = protocolDistribution({ sensor_id: 's1' }, db);
+  const s1Total = s1Only.reduce((sum, d) => sum + d.count, 0);
+  assert.equal(s1Total, 4, 'sensor_id filter should exclude the other sensor\'s events');
+  const s2Only = protocolDistribution({ sensor_id: 's2' }, db);
+  assert.equal(s2Only.reduce((sum, d) => sum + d.count, 0), 1);
+  const s1Talkers = topTalkers({ limit: 10, sensor_id: 's1' }, db);
+  assert.ok(!s1Talkers.some((t) => t.ip === '10.0.0.5'), 'topTalkers sensor_id filter should exclude s2\'s IP');
+
   // --- security ---
   runCorrelation(db); // asset-1 (embedded-or-iot, port 22) should trigger an alert
   const severity = severityBreakdown(db);
@@ -74,5 +86,10 @@ test('analytics + security aggregations', () => {
   assert.equal(flagged.length, 1);
   assert.equal(flagged[0].asset_id, 'asset-1');
   assert.ok(flagged[0].alerts.length >= 1);
-  assert.equal(flagged[0].alerts[0].rule, 'embedded_device_exposing_remote_admin');
+  // asset-1 (embedded-or-iot, port 22, speaks dicom on a non-standard
+  // port) can trigger both correlation rules — order between same-tick
+  // alerts isn't guaranteed (created_at has only second precision), so
+  // assert set membership rather than a specific array index.
+  const rules = flagged[0].alerts.map((a) => a.rule);
+  assert.ok(rules.includes('embedded_device_exposing_remote_admin'));
 });

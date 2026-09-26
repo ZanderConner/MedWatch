@@ -29,6 +29,16 @@ pub enum ApplicationProtocol {
     Ssh,
     Rdp,
     Smb,
+    Arp,
+    Icmp,
+    Ntp,
+    Snmp,
+    Mdns,
+    Ldap,
+    Syslog,
+    Ftp,
+    Telnet,
+    Smtp,
     Unknown,
 }
 
@@ -50,6 +60,16 @@ impl ApplicationProtocol {
             ApplicationProtocol::Ssh => "ssh",
             ApplicationProtocol::Rdp => "rdp",
             ApplicationProtocol::Smb => "smb",
+            ApplicationProtocol::Arp => "arp",
+            ApplicationProtocol::Icmp => "icmp",
+            ApplicationProtocol::Ntp => "ntp",
+            ApplicationProtocol::Snmp => "snmp",
+            ApplicationProtocol::Mdns => "mdns",
+            ApplicationProtocol::Ldap => "ldap",
+            ApplicationProtocol::Syslog => "syslog",
+            ApplicationProtocol::Ftp => "ftp",
+            ApplicationProtocol::Telnet => "telnet",
+            ApplicationProtocol::Smtp => "smtp",
             ApplicationProtocol::Unknown => "unknown",
         }
     }

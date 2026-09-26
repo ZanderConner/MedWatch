@@ -58,6 +58,19 @@ pub struct CaptureConfig {
     pub bpf_filter: Option<String>,
     #[serde(default = "default_asset_flush_secs")]
     pub asset_flush_interval_secs: u64,
+    /// Extra TCP/UDP ports (beyond the protocol crates' built-in defaults
+    /// 104/11112 for DICOM, 2575 for HL7) that carry DICOM on THIS site's
+    /// network — many real deployments (and this demo range's simulators)
+    /// don't use the IANA-registered ports. Without this, port-based
+    /// fallback classification only ever matches the standard ports and
+    /// everything else on a non-standard port falls through to "unknown"
+    /// even when payload sniffing also can't run (e.g. a mid-flow data
+    /// packet with no recognizable header of its own).
+    #[serde(default)]
+    pub dicom_ports: Vec<u16>,
+    /// Same idea as `dicom_ports`, for HL7 (beyond the built-in default 2575).
+    #[serde(default)]
+    pub hl7_ports: Vec<u16>,
 }
 
 /// Points at the team's backend ingest API, NOT Elasticsearch directly.

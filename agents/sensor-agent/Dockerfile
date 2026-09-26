@@ -27,12 +27,16 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
+      iproute2 \
       libcap2-bin \
       libpcap0.8 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --shell /usr/sbin/nologin medwatch
 
 COPY --from=build /src/target/release/medwatch-sensor /usr/local/bin/medwatch-sensor
+COPY agents/sensor-agent/resolve-bridge-and-run.sh /usr/local/bin/resolve-bridge-and-run.sh
+RUN chmod +x /usr/local/bin/resolve-bridge-and-run.sh
 
 # CAP_NET_RAW + CAP_NET_ADMIN on the binary itself so the container can run
 # as a non-root user and still open a capture handle (promiscuous mode /
@@ -46,6 +50,15 @@ RUN setcap 'cap_net_raw,cap_net_admin=eip' /usr/local/bin/medwatch-sensor
 # of baking deployment config into the image.
 COPY agents/sensor-agent/config/sensor-agent.toml /etc/medwatch/sensor-agent.toml
 
-USER medwatch
-ENTRYPOINT ["/usr/local/bin/medwatch-sensor"]
+# Deliberately root, not `medwatch`: the entrypoint wrapper needs to run
+# `ip link set <bridge> promisc on` on the HOST's network namespace
+# (--network host) and query the Docker API over the mounted socket to
+# resolve a bridge's name at container start, both of which need real
+# root/CAP_NET_ADMIN, not just the binary's own setcap grant. The
+# container already declares cap_add: [NET_ADMIN, NET_RAW] at the
+# compose level for exactly this reason — running the wrapper as
+# `medwatch` would need a second layer of setcap/sudo plumbing for no
+# real security benefit in this already-privileged, `--network host`
+# capture container.
+ENTRYPOINT ["/usr/local/bin/resolve-bridge-and-run.sh"]
 CMD ["--config", "/etc/medwatch/sensor-agent.toml"]

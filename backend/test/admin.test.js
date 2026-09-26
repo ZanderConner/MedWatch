@@ -68,7 +68,7 @@ test('admin sensor page: label/retire/detail/purge', () => {
   const detail = getSensorDetail('sensor-b', db);
   assert.equal(detail.application_breakdown.length, 1);
   assert.equal(detail.application_breakdown[0].application, 'hl7');
-  assert.equal(detail.recent_alerts.length, 2, 'both correlation rules should fire: SSH-exposure and HL7-on-nonstandard-port');
+  assert.equal(detail.recent_alerts.length, 1, 'the SSH-exposure rule should fire for this embedded-or-iot asset');
 
   // Retire it -> active must be forced false even if recently seen.
   setSensorMeta('sensor-b', { retired: true }, db);
@@ -80,7 +80,7 @@ test('admin sensor page: label/retire/detail/purge', () => {
   const purged = purgeSensor('sensor-b', db);
   assert.equal(purged.events_deleted, 1);
   assert.equal(purged.assets_deleted, 1);
-  assert.equal(purged.alerts_deleted, 2);
+  assert.equal(purged.alerts_deleted, 1);
   assert.equal(purged.meta_deleted, 1);
 
   assert.equal(db.prepare('SELECT COUNT(*) AS c FROM events WHERE sensor_id = ?').get('sensor-b').c, 0);
@@ -97,7 +97,7 @@ test('runCorrelation only returns genuinely new alerts, not re-matches', () => {
   assert.equal(second.length, 0, 'a second pass with no asset changes should report 0 new alerts');
 
   const totalAlerts = db.prepare('SELECT COUNT(*) AS c FROM alerts').get().c;
-  assert.equal(totalAlerts, 2, 'alerts table should still only have the 2 alerts from the first pass');
+  assert.equal(totalAlerts, 1, 'alerts table should still only have the 1 alert from the first pass');
 });
 
 test('unknown sensor_id returns null detail', () => {

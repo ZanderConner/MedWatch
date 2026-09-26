@@ -110,7 +110,12 @@ router.get('/assets/:asset_id', (req, res) => {
   res.json({ asset: rowToAsset(asset), recent_events: events });
 });
 
-// GET /api/v1/events?sensor_id=...&application=dicom&since=...&until=...&limit=100&offset=0
+// GET /api/v1/events?sensor_id=...&application=dicom&transport=tcp&search=10.20&since=...&until=...&limit=100&offset=0
+// `search` matches src_ip/dst_ip/src_mac/dst_mac by substring (case-
+// insensitive) — the Traffic Analysis page's free-text search box.
+// Response includes `total` (count matching the filters, ignoring
+// limit/offset) so the frontend can paginate through the FULL events
+// table instead of only ever seeing the most recent slice.
 router.get('/events', (req, res) => {
   const db = getDb();
   const limit = clampLimit(req.query.limit, 100, 1000);
@@ -127,6 +132,10 @@ router.get('/events', (req, res) => {
     clauses.push('application = ?');
     params.push(req.query.application);
   }
+  if (req.query.transport) {
+    clauses.push('transport = ?');
+    params.push(req.query.transport);
+  }
   if (req.query.since) {
     clauses.push('observed_at >= ?');
     params.push(req.query.since);
@@ -135,8 +144,16 @@ router.get('/events', (req, res) => {
     clauses.push('observed_at <= ?');
     params.push(req.query.until);
   }
+  if (req.query.search) {
+    clauses.push(
+      '(src_ip LIKE ? OR dst_ip LIKE ? OR src_mac LIKE ? OR dst_mac LIKE ?)'
+    );
+    const like = `%${req.query.search}%`;
+    params.push(like, like, like, like);
+  }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM events ${where}`).get(...params).n;
   const rows = db
     .prepare(
       `SELECT * FROM events ${where} ORDER BY observed_at DESC LIMIT ? OFFSET ?`
@@ -144,7 +161,7 @@ router.get('/events', (req, res) => {
     .all(...params, limit, offset)
     .map(rowToEvent);
 
-  res.json({ events: rows, limit, offset });
+  res.json({ events: rows, limit, offset, total });
 });
 
 // GET /api/v1/sensors — every sensor_id ever seen, with per-sensor

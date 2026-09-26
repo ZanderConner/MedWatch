@@ -30,14 +30,53 @@ pub struct AssociateRq {
     pub protocol_version: u16,
 }
 
+/// Which of the two DICOM upper-layer PDUs a parsed header came from.
+/// A-ASSOCIATE-RQ is sent BY the initiator (SCU) — its `calling_ae_title`
+/// identifies the sender. A-ASSOCIATE-AC is sent BY the acceptor (SCP,
+/// e.g. a PACS/archive like Orthanc) — critically, its `called_ae_title`
+/// field echoes back the RQ's addressee, which in practice is the
+/// acceptor's own real AE title (an SCP only accepts associations
+/// addressed to itself), so it doubles as reliable self-identification
+/// for a device that never initiates an association and therefore would
+/// otherwise never appear in a captured RQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduKind {
+    AssociateRq,
+    AssociateAc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociateHeader {
+    pub kind: PduKind,
+    pub called_ae_title: String,
+    pub calling_ae_title: String,
+    pub protocol_version: u16,
+}
+
 /// Parse a DICOM A-ASSOCIATE-RQ PDU (PS3.8 §9.3.2) from a raw TCP payload.
 /// Only the fixed-length header fields are read; variable items
 /// (Application Context, Presentation Context, User Info) are ignored since
 /// asset inventory only needs the AE titles.
 pub fn parse_associate_rq(buf: &[u8]) -> Result<AssociateRq, DicomParseError> {
-    // Fixed header: 1 byte PDU type, 1 reserved, 4 byte length,
-    // 2 byte protocol version, 2 reserved, 16 byte called AE, 16 byte calling AE,
-    // 32 reserved bytes = 74 bytes minimum before variable items.
+    let header = parse_associate_header(buf)?;
+    if header.kind != PduKind::AssociateRq {
+        return Err(DicomParseError::NotAssociatePdu(buf[0]));
+    }
+    Ok(AssociateRq {
+        called_ae_title: header.called_ae_title,
+        calling_ae_title: header.calling_ae_title,
+        protocol_version: header.protocol_version,
+    })
+}
+
+/// Parse either an A-ASSOCIATE-RQ or A-ASSOCIATE-AC PDU (both PS3.8
+/// §9.3.2/§9.3.3 share the same fixed 74-byte header layout: PDU type,
+/// reserved, length, protocol version, reserved, called AE, calling AE,
+/// reserved). Prefer this over `parse_associate_rq` when the caller cares
+/// about identifying BOTH sides of a DICOM association, not just the
+/// initiator — see `PduKind` for why the AC side matters for passively
+/// fingerprinting an SCP that never initiates traffic.
+pub fn parse_associate_header(buf: &[u8]) -> Result<AssociateHeader, DicomParseError> {
     const HEADER_LEN: usize = 74;
     if buf.len() < HEADER_LEN {
         return Err(DicomParseError::TooShort {
@@ -45,15 +84,18 @@ pub fn parse_associate_rq(buf: &[u8]) -> Result<AssociateRq, DicomParseError> {
             have: buf.len(),
         });
     }
-    if buf[0] != PDU_TYPE_ASSOCIATE_RQ {
-        return Err(DicomParseError::NotAssociatePdu(buf[0]));
-    }
+    let kind = match buf[0] {
+        PDU_TYPE_ASSOCIATE_RQ => PduKind::AssociateRq,
+        PDU_TYPE_ASSOCIATE_AC => PduKind::AssociateAc,
+        other => return Err(DicomParseError::NotAssociatePdu(other)),
+    };
 
     let protocol_version = u16::from_be_bytes([buf[6], buf[7]]);
     let called_ae_title = extract_ae_title(&buf[10..26])?;
     let calling_ae_title = extract_ae_title(&buf[26..42])?;
 
-    Ok(AssociateRq {
+    Ok(AssociateHeader {
+        kind,
         called_ae_title,
         calling_ae_title,
         protocol_version,
@@ -98,8 +140,24 @@ fn extract_ae_title(field: &[u8]) -> Result<String, DicomParseError> {
     if field.len() != 16 {
         return Err(DicomParseError::MalformedAeTitle);
     }
-    // AE titles are space-padded ASCII, fixed 16 bytes.
+    // AE titles are space-padded ASCII, fixed 16 bytes, restricted to the
+    // DICOM default character repertoire (PS3.5 §6.1.2.3: uppercase/
+    // lowercase letters, digits, and a handful of punctuation — no
+    // control characters). Reject anything outside printable ASCII
+    // rather than using from_utf8_lossy's replacement-character
+    // fallback: `looks_like_dicom`'s cheap 10-byte header sniff only
+    // validates PDU type/reserved-bytes/length, NOT these title bytes,
+    // so a false-positive match on arbitrary non-DICOM payload can
+    // reach here with raw binary garbage in this field — that garbage
+    // must never be accepted as a device's identity, since it silently
+    // clobbers a previously-good name (see the MRISIM regression this
+    // caught: an intermittent non-DICOM TCP chunk momentarily matched
+    // the loose sniff and overwrote a device's correct AE title with
+    // control-character noise for a few seconds).
     let trimmed: Vec<u8> = field.iter().copied().take_while(|&b| b != 0).collect();
+    if !trimmed.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+        return Err(DicomParseError::MalformedAeTitle);
+    }
     let s = String::from_utf8_lossy(&trimmed).trim().to_string();
     if s.is_empty() {
         Err(DicomParseError::MalformedAeTitle)
@@ -112,9 +170,9 @@ fn extract_ae_title(field: &[u8]) -> Result<String, DicomParseError> {
 mod tests {
     use super::*;
 
-    fn build_associate_rq(called: &str, calling: &str) -> Vec<u8> {
+    fn build_associate_rq(pdu_type: u8, called: &str, calling: &str) -> Vec<u8> {
         let mut buf = vec![0u8; 74];
-        buf[0] = PDU_TYPE_ASSOCIATE_RQ;
+        buf[0] = pdu_type;
         buf[1] = 0x00; // reserved
         buf[2..6].copy_from_slice(&66u32.to_be_bytes()); // pdu length (arbitrary, unread)
         buf[6..8].copy_from_slice(&1u16.to_be_bytes()); // protocol version 1
@@ -131,11 +189,51 @@ mod tests {
 
     #[test]
     fn parses_ae_titles_from_associate_rq() {
-        let buf = build_associate_rq("PACS_MAIN", "CT_SCANNER_3");
+        let buf = build_associate_rq(PDU_TYPE_ASSOCIATE_RQ, "PACS_MAIN", "CT_SCANNER_3");
         let rq = parse_associate_rq(&buf).unwrap();
         assert_eq!(rq.called_ae_title, "PACS_MAIN");
         assert_eq!(rq.calling_ae_title, "CT_SCANNER_3");
         assert_eq!(rq.protocol_version, 1);
+    }
+
+    #[test]
+    fn parses_associate_ac_header_for_responder_self_identification() {
+        // An A-ASSOCIATE-AC sent BY Orthanc echoes back the RQ's called
+        // AE title ("ORTHANC", the responder's own real name) in the
+        // same field position — this is how a passive sensor identifies
+        // an SCP/archive that never itself sends an RQ.
+        let buf = build_associate_rq(PDU_TYPE_ASSOCIATE_AC, "ORTHANC", "CTSIM");
+        let header = parse_associate_header(&buf).unwrap();
+        assert_eq!(header.kind, PduKind::AssociateAc);
+        assert_eq!(header.called_ae_title, "ORTHANC");
+        assert_eq!(header.calling_ae_title, "CTSIM");
+
+        // parse_associate_rq stays RQ-only (existing callers expect that).
+        assert_eq!(
+            parse_associate_rq(&buf).unwrap_err(),
+            DicomParseError::NotAssociatePdu(PDU_TYPE_ASSOCIATE_AC)
+        );
+    }
+
+    #[test]
+    fn rejects_ae_title_with_non_printable_bytes() {
+        // The exact class of bug this guards against: a false-positive
+        // `looks_like_dicom` match on non-DICOM payload can put raw
+        // binary garbage (control bytes, high-bit bytes) into the AE
+        // title field position. from_utf8_lossy alone would happily
+        // turn that into a string full of U+FFFD replacement
+        // characters and a stray control char — accepted here instead
+        // means a device's real, previously-learned identity gets
+        // silently clobbered by noise. Must be rejected as malformed.
+        let mut buf = build_associate_rq(PDU_TYPE_ASSOCIATE_RQ, "MRISIM", "ORTHANC");
+        buf[10] = 0x02;
+        buf[11] = 0xff; // invalid UTF-8 continuation byte
+        buf[12] = 0x01;
+        buf[13] = 0xfe;
+        assert_eq!(
+            parse_associate_rq(&buf).unwrap_err(),
+            DicomParseError::MalformedAeTitle
+        );
     }
 
     #[test]
@@ -146,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_pdu_type() {
-        let mut buf = build_associate_rq("A", "B");
+        let mut buf = build_associate_rq(PDU_TYPE_ASSOCIATE_RQ, "A", "B");
         buf[0] = 0x07; // A-ABORT
         assert_eq!(
             parse_associate_rq(&buf).unwrap_err(),
@@ -156,7 +254,7 @@ mod tests {
 
     #[test]
     fn looks_like_dicom_matches_real_associate_headers() {
-        let rq = build_associate_rq("A", "B");
+        let rq = build_associate_rq(PDU_TYPE_ASSOCIATE_RQ, "A", "B");
         assert!(looks_like_dicom(&rq));
         let mut ac = rq.clone();
         ac[0] = PDU_TYPE_ASSOCIATE_AC;

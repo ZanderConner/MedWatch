@@ -25,6 +25,7 @@ function rowToAsset(row) {
     updated_at: row.updated_at,
     source: row.source,
     confirmed: Boolean(row.confirmed),
+    notes: row.notes ?? null,
   };
 }
 
@@ -82,10 +83,23 @@ function createManualAsset(input, db = getDb()) {
 }
 
 // PATCH /api/v1/admin/assets/:asset_id — confirm/unconfirm an
-// agent-discovered asset, or edit its device_identity_hint (the one
-// field an admin is likely to want to correct/add, e.g. naming an
-// auto-discovered MAC "Infusion Pump #04").
-function updateAsset(assetId, { confirmed, device_identity_hint }, db = getDb()) {
+// agent-discovered asset, or edit its device_identity_hint / os_guess /
+// ip_addresses / mac_address / notes (the fields an admin is likely to
+// want to correct or annotate, e.g. naming an auto-discovered MAC
+// "Infusion Pump #04", fixing a wrong OS classification, correcting a
+// stale IP, or leaving a note like "swapped 2026-09, see ticket #412").
+//
+// Confirming an asset also clears any existing correlation alerts for
+// it: confirmation means an admin has reviewed the device and accepted
+// it as known-good, so stale "this looks unusual" alerts from before
+// the review no longer add value (and runCorrelation() won't generate
+// new ones for it going forward, and actively sweeps any that reappear
+// — see correlation/rules.js).
+function updateAsset(
+  assetId,
+  { confirmed, device_identity_hint, os_guess, ip_addresses, mac_address, notes },
+  db = getDb()
+) {
   const existing = db.prepare('SELECT * FROM assets WHERE asset_id = ?').get(assetId);
   if (!existing) return null;
 
@@ -93,13 +107,31 @@ function updateAsset(assetId, { confirmed, device_identity_hint }, db = getDb())
     confirmed: confirmed !== undefined ? (confirmed ? 1 : 0) : existing.confirmed,
     device_identity_hint:
       device_identity_hint !== undefined ? device_identity_hint : existing.device_identity_hint,
+    os_guess: os_guess !== undefined ? os_guess : existing.os_guess,
+    ip_addresses:
+      ip_addresses !== undefined ? JSON.stringify(ip_addresses) : existing.ip_addresses,
+    mac_address: mac_address !== undefined ? mac_address : existing.mac_address,
+    notes: notes !== undefined ? notes : existing.notes,
   };
 
   db.prepare(
-    `UPDATE assets SET confirmed = ?, device_identity_hint = ?,
+    `UPDATE assets SET confirmed = ?, device_identity_hint = ?, os_guess = ?,
+       ip_addresses = ?, mac_address = ?, notes = ?,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE asset_id = ?`
-  ).run(next.confirmed, next.device_identity_hint, assetId);
+  ).run(
+    next.confirmed,
+    next.device_identity_hint,
+    next.os_guess,
+    next.ip_addresses,
+    next.mac_address,
+    next.notes,
+    assetId
+  );
+
+  if (confirmed === true) {
+    db.prepare('DELETE FROM alerts WHERE asset_id = ?').run(assetId);
+  }
 
   return rowToAsset(db.prepare('SELECT * FROM assets WHERE asset_id = ?').get(assetId));
 }

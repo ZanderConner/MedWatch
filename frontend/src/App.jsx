@@ -48,6 +48,22 @@ const FALLBACK_EVENTS = [
 
 const FALLBACK_ALERTS = [];
 
+// Formats a whole-seconds uptime as "2d 4h 12m" (drops leading zero
+// units so a freshly-booted backend shows "12m" not "0d 0h 12m").
+function formatUptime(seconds) {
+  if (seconds == null) return '—';
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (d || h) parts.push(`${h}h`);
+  if (d || h || m) parts.push(`${m}m`);
+  if (!d && !h) parts.push(`${s}s`);
+  return parts.join(' ');
+}
+
 // GET helper: unwraps the backend's { <key>: [...] } envelope shape
 // (every list endpoint wraps its array — see backend/api/routes.js,
 // backend/alerting/routes.js, backend/api/sensors.js) and never throws
@@ -68,12 +84,31 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [inventory, setInventory] = useState([]);
   const [inventoryError, setInventoryError] = useState(null);
-  const [inventoryFilter, setInventoryFilter] = useState('PENDING');
+  const [inventoryFilter, setInventoryFilter] = useState('ALL');
   const [addForm, setAddForm] = useState({ device_identity_hint: '', ip_addresses: '', mac_address: '', os_guess: 'unknown' });
   const [page, setPage] = useState('OVERVIEW');
   const [sensor, setSensor] = useState('ALL');
   const [filter, setFilter] = useState('ALL');
   const [modal, setModal] = useState(null);
+  const [editingAsset, setEditingAsset] = useState(null);
+  const [editForm, setEditForm] = useState({ device_identity_hint: '', os_guess: 'unknown', ip_addresses: '', mac_address: '', notes: '' });
+  // Analytics lookback window, in minutes (0 = no lower bound / all time).
+  // Drives every /api/v1/analytics/* fetch below so the Analytics page can
+  // be scoped to "last 15 min" through "all time" instead of being stuck
+  // showing whatever's in the last (capped) 500-event fetch.
+  const [lookbackMinutes, setLookbackMinutes] = useState(60);
+  const [analyticsData, setAnalyticsData] = useState(null);
+  const [systemHealth, setSystemHealth] = useState(null);
+  // Traffic Analysis page: server-paginated/filtered view over the FULL
+  // events table (not the 500-row cap used for the live stream widgets).
+  const [trafficRows, setTrafficRows] = useState([]);
+  const [trafficTotal, setTrafficTotal] = useState(0);
+  const [trafficPage, setTrafficPage] = useState(0);
+  const [trafficFilters, setTrafficFilters] = useState({ application: '', transport: '', search: '' });
+  const TRAFFIC_PAGE_SIZE = 50;
+  // Security page: severity breakdown + flagged (alerted) assets, each
+  // asset carrying its own list of triggered alert rules/messages.
+  const [securityData, setSecurityData] = useState(null);
 
   const loadInventory = async () => {
     try {
@@ -111,11 +146,33 @@ export default function App() {
     };
     load();
     loadInventory();
-    const id = setInterval(() => { load(); loadInventory(); }, 5000);
+    // Poll every few seconds — analytics/alerts/inventory should feel
+    // live for a security-monitoring dashboard, not update once a minute.
+    const id = setInterval(() => { load(); loadInventory(); }, 3000);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
+  }, []);
+
+  // System-health snapshot (backend uptime, per-sensor liveness,
+  // headline counts) backs the Overview page's "System Status" panel.
+  // Fetched independently of the analytics-page effect below since the
+  // Overview page needs it even when the Analytics page has never been
+  // opened.
+  useEffect(() => {
+    let cancelled = false;
+    const fetchHealth = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/v1/analytics/system-health`);
+        if (res.ok && !cancelled) setSystemHealth(await res.json());
+      } catch {
+        // backend unreachable — keep whatever's already on screen
+      }
+    };
+    fetchHealth();
+    const id = setInterval(fetchHealth, 3000);
+    return () => { cancelled = true; clearInterval(id); };
   }, []);
 
   const confirmAsset = async (assetId) => {
@@ -124,6 +181,48 @@ export default function App() {
         method: 'PATCH',
         body: JSON.stringify({ confirmed: true }),
       });
+      loadInventory();
+    } catch (err) {
+      setInventoryError(err.message);
+    }
+  };
+
+  const unconfirmAsset = async (assetId) => {
+    try {
+      await adminFetch(`/api/v1/admin/assets/${encodeURIComponent(assetId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ confirmed: false }),
+      });
+      loadInventory();
+    } catch (err) {
+      setInventoryError(err.message);
+    }
+  };
+
+  const startEditAsset = (asset) => {
+    setEditingAsset(asset.asset_id);
+    setEditForm({
+      device_identity_hint: asset.device_identity_hint || '',
+      os_guess: asset.os_guess || 'unknown',
+      ip_addresses: (asset.ip_addresses || []).join(', '),
+      mac_address: asset.mac_address || '',
+      notes: asset.notes || '',
+    });
+  };
+
+  const saveEditAsset = async (assetId) => {
+    try {
+      await adminFetch(`/api/v1/admin/assets/${encodeURIComponent(assetId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          device_identity_hint: editForm.device_identity_hint.trim() || null,
+          os_guess: editForm.os_guess,
+          ip_addresses: editForm.ip_addresses.split(',').map(s => s.trim()).filter(Boolean),
+          mac_address: editForm.mac_address.trim() || null,
+          notes: editForm.notes.trim() || null,
+        }),
+      });
+      setEditingAsset(null);
       loadInventory();
     } catch (err) {
       setInventoryError(err.message);
@@ -247,6 +346,114 @@ export default function App() {
     };
   }, [sensorEvents, assets, isSuspiciousEvent]);
 
+  // Server-side analytics: aggregated directly by the backend over the
+  // FULL events table (not capped to the last 500 rows the rest of this
+  // app fetches for the live packet stream), scoped by the selected
+  // lookback window and capture-node filter. This is what actually
+  // backs the Analytics page's charts — the client-side `analytics`
+  // object above only ever sees a capped recent slice and stays for the
+  // Overview page's live "last N packets" widgets.
+  useEffect(() => {
+    if (page !== 'ANALYTICS') return;
+    let cancelled = false;
+    const fetchAnalytics = async () => {
+      const since = lookbackMinutes > 0
+        ? new Date(Date.now() - lookbackMinutes * 60_000).toISOString()
+        : undefined;
+      const qs = new URLSearchParams();
+      if (since) qs.set('since', since);
+      if (sensor !== 'ALL') qs.set('sensor_id', sensor);
+      const qsInterval = new URLSearchParams(qs);
+      qsInterval.set('interval', 'minute');
+      try {
+        const [ts, proto, transport, os, talkers] = await Promise.all([
+          fetch(`${API_URL}/api/v1/analytics/events-timeseries?${qsInterval}`).then(r => r.json()),
+          fetch(`${API_URL}/api/v1/analytics/protocol-distribution?${qs}`).then(r => r.json()),
+          fetch(`${API_URL}/api/v1/analytics/transport-distribution?${qs}`).then(r => r.json()),
+          fetch(`${API_URL}/api/v1/analytics/os-distribution?${qs}`).then(r => r.json()),
+          fetch(`${API_URL}/api/v1/analytics/top-talkers?limit=10&${qs}`).then(r => r.json()),
+        ]);
+        if (!cancelled) {
+          setAnalyticsData({
+            timeseries: ts.buckets || [],
+            protocols: proto.distribution || [],
+            transports: transport.distribution || [],
+            osBreakdown: os.distribution || [],
+            topTalkers: talkers.top_talkers || [],
+          });
+        }
+      } catch {
+        // backend unreachable — keep whatever's already on screen
+      }
+    };
+    fetchAnalytics();
+    const id = setInterval(fetchAnalytics, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [page, lookbackMinutes, sensor]);
+
+  // Traffic Analysis page fetch: server-side filter/search/paginate over
+  // the full events table via GET /api/v1/events (see backend/api/routes.js).
+  useEffect(() => {
+    if (page !== 'TRAFFIC') return;
+    let cancelled = false;
+    const fetchTraffic = async () => {
+      const qs = new URLSearchParams();
+      qs.set('limit', TRAFFIC_PAGE_SIZE);
+      qs.set('offset', trafficPage * TRAFFIC_PAGE_SIZE);
+      if (sensor !== 'ALL') qs.set('sensor_id', sensor);
+      if (trafficFilters.application) qs.set('application', trafficFilters.application);
+      if (trafficFilters.transport) qs.set('transport', trafficFilters.transport);
+      if (trafficFilters.search) qs.set('search', trafficFilters.search);
+      try {
+        const body = await fetch(`${API_URL}/api/v1/events?${qs}`).then(r => r.json());
+        if (!cancelled) {
+          setTrafficRows(body.events || []);
+          setTrafficTotal(body.total ?? 0);
+        }
+      } catch {
+        // backend unreachable — keep whatever's already on screen
+      }
+    };
+    fetchTraffic();
+    const id = setInterval(fetchTraffic, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [page, trafficPage, trafficFilters, sensor]);
+
+  // Reset to page 0 whenever a filter changes so you're not stranded on
+  // an out-of-range offset for the new (smaller) result set.
+  useEffect(() => { setTrafficPage(0); }, [trafficFilters, sensor]);
+
+  // Security page fetch: severity breakdown + flagged assets + policy
+  // violations (alerts) bucketed over time for the "Policy Violations
+  // Over Time" chart. Always all-time/hourly — the Security page has no
+  // lookback-window control (that's the Analytics page's job).
+  useEffect(() => {
+    if (page !== 'SECURITY') return;
+    let cancelled = false;
+    const fetchSecurity = async () => {
+      try {
+        const [breakdown, flagged, violations] = await Promise.all([
+          fetch(`${API_URL}/api/v1/security/severity-breakdown`).then(r => r.json()),
+          fetch(`${API_URL}/api/v1/security/flagged-assets`).then(r => r.json()),
+          fetch(`${API_URL}/api/v1/security/violations-timeseries?interval=minute`).then(r => r.json()),
+        ]);
+        if (!cancelled) {
+          setSecurityData({
+            breakdown: breakdown.breakdown || [],
+            flaggedAssets: flagged.assets || [],
+            violationsTimeseries: violations.buckets || [],
+          });
+        }
+      } catch {
+        // backend unreachable — keep whatever's already on screen
+      }
+    };
+    fetchSecurity();
+    const id = setInterval(fetchSecurity, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [page]);
+
+
   const statsStrip = page === 'AGENTS' ? [
     { label: "Known Sensors", val: enrichedAgents.length, sub: "reporting" },
     { label: "Active Sensors", val: enrichedAgents.filter(a => a.active).length, sub: `of ${enrichedAgents.length}` },
@@ -274,7 +481,7 @@ export default function App() {
           </div>
 
           <nav style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {[['OVERVIEW', 'Overview', sensor === 'ALL' ? (stats?.total_events ?? sensorEvents.length) : sensorEvents.length], ['INVENTORY', 'Asset Inventory', pendingCount || undefined], ['ANALYTICS', 'Traffic Analytics'], ['AGENTS', 'Security & Agents', activeSensors.length]].map(([id, label, count]) => (
+            {[['OVERVIEW', 'Overview', sensor === 'ALL' ? (stats?.total_events ?? sensorEvents.length) : sensorEvents.length], ['INVENTORY', 'Asset Inventory', pendingCount || undefined], ['TRAFFIC', 'Traffic Analysis'], ['ANALYTICS', 'Traffic Analytics'], ['SECURITY', 'Security', alertedAssetIds.size || undefined], ['AGENTS', 'Sensors', activeSensors.length]].map(([id, label, count]) => (
               <button key={id} onClick={() => setPage(id)} className={`nav-btn ${page === id ? 'active' : ''}`}>
                 <span>{label}</span>
                 {count !== undefined && <span className="muted" style={{ fontSize: 11 }}>{count}</span>}
@@ -302,7 +509,7 @@ export default function App() {
           <header className="topbar">
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <span className="sub">MedWatch</span><span className="muted">/</span>
-              <strong>{{ OVERVIEW: "Telemetry Stream", INVENTORY: "Asset Inventory", ANALYTICS: "Traffic Analytics", AGENTS: "Sensor Fleet" }[page]}</strong>
+              <strong>{{ OVERVIEW: "Dashboard", INVENTORY: "Asset Inventory", TRAFFIC: "Traffic Analysis", ANALYTICS: "Traffic Analytics", SECURITY: "Security", AGENTS: "Sensors" }[page]}</strong>
               {sensor !== 'ALL' && (
                 <>
                   <span className="muted">/</span>
@@ -339,7 +546,7 @@ export default function App() {
                       raw: JSON.stringify(ag, null, 2)
                     })}>
                       <td><span className="teal">● </span><strong>{ag.sensor_id}</strong></td>
-                      <td className={ag.active ? 'teal' : 'muted'} style={{ fontSize: 12 }}>{ag.active ? 'active' : 'inactive'}</td>
+                      <td style={{ fontSize: 12 }}><span className={`badge ${ag.active ? 'badge-ok' : 'badge-muted'}`}>{ag.active ? 'Active' : 'Inactive'}</span></td>
                       <td className="sub" style={{ fontSize: 12 }}>{ag.event_count}</td>
                       <td className="sub" style={{ fontSize: 12 }}>{ag.asset_count}</td>
                       <td className="sub" style={{ fontSize: 12, textAlign: 'right' }}>
@@ -398,7 +605,7 @@ export default function App() {
               <div className="section-hdr">
                 <strong>Inventory</strong>
                 <div style={{ display: 'flex', gap: 4 }}>
-                  {[['PENDING', `Pending (${pendingCount})`], ['CONFIRMED', 'Confirmed'], ['ALL', 'All']].map(([id, label]) => (
+                  {[['ALL', 'All'], ['CONFIRMED', `Confirmed (${inventory.filter(a => a.confirmed).length})`], ['PENDING', `Pending (${pendingCount})`]].map(([id, label]) => (
                     <button key={id} onClick={() => setInventoryFilter(id)} className={`pill-btn ${inventoryFilter === id ? 'active' : ''}`} style={{ fontSize: 11 }}>{label}</button>
                   ))}
                 </div>
@@ -407,34 +614,90 @@ export default function App() {
               <div className="panel">
                 <table>
                   <thead>
-                    <tr><th>Device</th><th>Source</th><th>IP / MAC</th><th>OS Guess</th><th>Status</th><th style={{ textAlign: 'right' }}>Actions</th></tr>
+                    <tr><th>Device</th><th>Source</th><th>IP / MAC</th><th>OS Guess</th><th>Observed Endpoints</th><th>Status</th><th style={{ textAlign: 'right' }}>Actions</th></tr>
                   </thead>
                   <tbody>
                     {visibleInventory.map(a => (
                       <tr key={a.asset_id} className="log-row">
-                        <td onClick={() => setModal({ title: a.asset_id, raw: JSON.stringify(a, null, 2) })}>
-                          <strong>{a.device_identity_hint || a.asset_id}</strong>
-                        </td>
-                        <td className="sub" style={{ fontSize: 12 }}>
-                          <span className={a.source === 'manual' ? 'teal' : 'muted'}>{a.source === 'manual' ? 'Manual' : 'Auto-detected'}</span>
-                        </td>
-                        <td className="sub" style={{ fontSize: 12 }}>{[...(a.ip_addresses || []), a.mac_address].filter(Boolean).join(', ') || '—'}</td>
-                        <td className="sub" style={{ fontSize: 12 }}>{a.os_guess}</td>
-                        <td style={{ fontSize: 11.5 }}>
-                          <span className={a.confirmed ? 'teal' : 'danger'}>{a.confirmed ? 'Confirmed' : 'Pending review'}</span>
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                            {!a.confirmed && (
-                              <button onClick={() => confirmAsset(a.asset_id)} className="pill-btn active" style={{ fontSize: 11 }}>Confirm</button>
-                            )}
-                            <button onClick={() => removeAsset(a.asset_id)} className="pill-btn" style={{ fontSize: 11 }}>Remove</button>
-                          </div>
-                        </td>
+                        {editingAsset === a.asset_id ? (
+                          <td colSpan={7} style={{ padding: '14px 16px' }}>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                                <input
+                                  autoFocus
+                                  value={editForm.device_identity_hint}
+                                  onChange={e => setEditForm({ ...editForm, device_identity_hint: e.target.value })}
+                                  placeholder="Device name"
+                                  style={{ flex: '1 1 220px', background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '6px 8px', color: '#e6e9ef', fontSize: 12 }}
+                                />
+                                <input
+                                  value={editForm.ip_addresses}
+                                  onChange={e => setEditForm({ ...editForm, ip_addresses: e.target.value })}
+                                  placeholder="IP address(es), comma-separated"
+                                  style={{ flex: '1 1 220px', background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '6px 8px', color: '#e6e9ef', fontSize: 12 }}
+                                />
+                                <input
+                                  value={editForm.mac_address}
+                                  onChange={e => setEditForm({ ...editForm, mac_address: e.target.value })}
+                                  placeholder="MAC address"
+                                  style={{ flex: '1 1 160px', background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '6px 8px', color: '#e6e9ef', fontSize: 12 }}
+                                />
+                                <select
+                                  value={editForm.os_guess}
+                                  onChange={e => setEditForm({ ...editForm, os_guess: e.target.value })}
+                                  style={{ background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '6px 8px', color: '#e6e9ef', fontSize: 12 }}
+                                >
+                                  {['unknown', 'windows', 'linux', 'bsd', 'network-appliance', 'embedded-or-iot'].map(o => <option key={o} value={o}>{o}</option>)}
+                                </select>
+                              </div>
+                              <input
+                                value={editForm.notes}
+                                onChange={e => setEditForm({ ...editForm, notes: e.target.value })}
+                                placeholder='Notes (e.g. "biomed-owned, ticket #412")'
+                                style={{ background: '#0e1013', border: '1px solid #1c1f26', borderRadius: 4, padding: '6px 8px', color: '#e6e9ef', fontSize: 12 }}
+                              />
+                              <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                <button onClick={() => saveEditAsset(a.asset_id)} className="pill-btn active" style={{ fontSize: 11 }}>Save</button>
+                                <button onClick={() => setEditingAsset(null)} className="pill-btn" style={{ fontSize: 11 }}>Cancel</button>
+                              </div>
+                            </div>
+                          </td>
+                        ) : (
+                          <>
+                            <td onClick={() => setModal({ title: a.device_identity_hint || a.asset_id, raw: JSON.stringify(a, null, 2) })}>
+                              <strong>{a.device_identity_hint || a.asset_id}</strong>
+                              {a.notes && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>{a.notes}</div>}
+                            </td>
+                            <td className="sub" style={{ fontSize: 12 }}>
+                              <span className={a.source === 'manual' ? 'teal' : 'muted'}>{a.source === 'manual' ? 'Manual' : 'Auto-detected'}</span>
+                            </td>
+                            <td className="sub mono-data" style={{ fontSize: 12 }}>{[...(a.ip_addresses || []), a.mac_address].filter(Boolean).join(', ') || '—'}</td>
+                            <td className="sub" style={{ fontSize: 12 }}>{a.os_guess}</td>
+                            <td className="sub" style={{ fontSize: 11.5, maxWidth: 220 }}>
+                              <div>{(a.observed_protocols || []).map(p => p.toUpperCase()).join(', ') || '—'}</div>
+                              <div className="muted mono-data" style={{ fontSize: 10.5 }}>ports: {(a.observed_ports || []).slice(0, 8).join(', ') || '—'}{(a.observed_ports || []).length > 8 ? ` +${a.observed_ports.length - 8} more` : ''}</div>
+                            </td>
+                            <td style={{ fontSize: 11.5 }}>
+                              <span className={`badge ${a.confirmed ? 'badge-ok' : 'badge-warn'}`}>{a.confirmed ? 'Confirmed' : 'Pending'}</span>
+                            </td>
+                            <td style={{ textAlign: 'right' }}>
+                              <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                {!a.confirmed && (
+                                  <button onClick={() => confirmAsset(a.asset_id)} className="pill-btn active" style={{ fontSize: 11 }}>Confirm</button>
+                                )}
+                                {a.confirmed && a.source !== 'manual' && (
+                                  <button onClick={() => unconfirmAsset(a.asset_id)} className="pill-btn" style={{ fontSize: 11 }}>Unconfirm</button>
+                                )}
+                                <button onClick={() => startEditAsset(a)} className="pill-btn" style={{ fontSize: 11 }}>Edit</button>
+                                <button onClick={() => removeAsset(a.asset_id)} className="pill-btn" style={{ fontSize: 11 }}>Remove</button>
+                              </div>
+                            </td>
+                          </>
+                        )}
                       </tr>
                     ))}
                     {visibleInventory.length === 0 && (
-                      <tr><td colSpan={6} className="muted" style={{ fontSize: 12, textAlign: 'center', padding: 20 }}>No assets in this view.</td></tr>
+                      <tr><td colSpan={7} className="muted" style={{ fontSize: 12, textAlign: 'center', padding: 20 }}>No assets in this view.</td></tr>
                     )}
                   </tbody>
                 </table>
@@ -445,11 +708,21 @@ export default function App() {
           {/* PAGE 2: ANALYTICS */}
           {page === 'ANALYTICS' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+              <div className="section-hdr">
+                <strong>Lookback Window</strong>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {[[15, '15m'], [60, '1h'], [360, '6h'], [1440, '24h'], [10080, '7d'], [0, 'All time']].map(([mins, label]) => (
+                    <button key={mins} onClick={() => setLookbackMinutes(mins)} className={`pill-btn ${lookbackMinutes === mins ? 'active' : ''}`} style={{ fontSize: 11 }}>{label}</button>
+                  ))}
+                </div>
+              </div>
+
               <div className="panel" style={{ padding: '18px 20px' }}>
-                <div className="section-hdr"><strong>Packet Throughput & Anomalies</strong><span className="muted" style={{ fontSize: 11 }}>Teal: Volume (KB) · Red: Violation</span></div>
+                <div className="section-hdr"><strong>Network Traffic Over Time</strong><span className="muted" style={{ fontSize: 11 }}>server-aggregated, full history in window</span></div>
                 {(() => {
-                  const b = analytics.buckets, maxB = Math.max(...b.map(x => x.bytes), 2048);
-                  const pts = b.map((x, i) => ({ ...x, x: 36 + (b.length > 1 ? (i / (b.length - 1)) * 868 : 434), y: 14 + 125 - (x.bytes / maxB) * 125 }));
+                  const b = analyticsData?.timeseries || [];
+                  const maxB = Math.max(...b.map(x => x.count), 1);
+                  const pts = b.map((x, i) => ({ ...x, x: 36 + (b.length > 1 ? (i / (b.length - 1)) * 868 : 434), y: 14 + 125 - (x.count / maxB) * 125 }));
                   const line = pts.map((p, i) => `${i ? 'L' : 'M'} ${p.x} ${p.y}`).join(' ');
                   return (
                     <svg viewBox="0 0 920 165" style={{ width: '100%', height: 175 }}>
@@ -457,10 +730,11 @@ export default function App() {
                       {pts.length > 1 && <path d={line} fill="none" stroke="#2dd4bf" strokeWidth="1.5" />}
                       {pts.map((p, i) => (
                         <g key={i}>
-                          <circle cx={p.x} cy={p.y} r={p.flagged ? 4 : 2.5} fill={p.flagged ? '#e5484d' : '#0e1013'} stroke={p.flagged ? '#e5484d' : '#2dd4bf'} strokeWidth="1.5" />
-                          <text x={p.x} y="158" textAnchor="middle" fill="#636975" fontSize="10">{p.time}</text>
+                          <circle cx={p.x} cy={p.y} r={2.5} fill="#0e1013" stroke="#2dd4bf" strokeWidth="1.5" />
+                          <text x={p.x} y="158" textAnchor="middle" fill="#636975" fontSize="9">{p.bucket?.slice(5, 16).replace('T', ' ')}</text>
                         </g>
                       ))}
+                      {pts.length === 0 && <text x="460" y="80" textAnchor="middle" fill="#636975" fontSize="12">No events in this window</text>}
                     </svg>
                   );
                 })()}
@@ -468,73 +742,333 @@ export default function App() {
 
               <div className="split-grid">
                 <div style={{ padding: '18px 20px', borderRight: '1px solid #1c1f26' }}>
-                  <div className="section-hdr"><strong>Application Protocols</strong><span className="muted" style={{ fontSize: 11 }}>PKTS / VOL</span></div>
-                  {analytics.protocols.map(p => (
-                    <div key={p.name} className="bar-row">
-                      <div className="bar-fill" style={{ width: `${p.pct}%`, background: 'rgba(45,212,191,0.06)', borderLeft: '2px solid #2dd4bf' }} />
-                      <span style={{ position: 'relative' }}>{p.name}</span>
-                      <span className="sub" style={{ position: 'relative', fontSize: 12 }}>{p.count} · {(p.bytes / 1024).toFixed(1)} KB</span>
-                    </div>
-                  ))}
+                  <div className="section-hdr"><strong>Application Protocols</strong><span className="muted" style={{ fontSize: 11 }}>EVENTS</span></div>
+                  {(() => {
+                    const dist = analyticsData?.protocols || [];
+                    const total = dist.reduce((s, d) => s + d.count, 0) || 1;
+                    return dist.map(p => (
+                      <div key={p.application} className="bar-row">
+                        <div className="bar-fill" style={{ width: `${Math.round((p.count / total) * 100)}%`, background: 'rgba(45,212,191,0.06)', borderLeft: '2px solid #2dd4bf' }} />
+                        <span style={{ position: 'relative' }}>{(p.application || 'unknown').toUpperCase()}</span>
+                        <span className="sub" style={{ position: 'relative', fontSize: 12 }}>{p.count}</span>
+                      </div>
+                    ));
+                  })()}
                 </div>
                 <div style={{ padding: '18px 20px' }}>
-                  <div className="section-hdr"><strong>Top Source Endpoints</strong><span className="muted" style={{ fontSize: 11 }}>STATUS / VOL</span></div>
-                  {analytics.topTalkers.map(d => {
-                    const pct = Math.round((d.bytes / Math.max(...analytics.topTalkers.map(x => x.bytes), 1)) * 100);
-                    return (
-                      <div key={d.ip} className="bar-row">
-                        <div className="bar-fill" style={{ width: `${pct}%`, background: d.flagged ? 'rgba(229,72,77,0.07)' : 'rgba(138,143,152,0.06)', borderLeft: `2px solid ${d.flagged ? '#e5484d' : '#636975'}` }} />
-                        <span style={{ position: 'relative' }}>{d.name} <span className="muted" style={{ fontSize: 11.5, marginLeft: 4 }}>{d.ip}</span></span>
-                        <span style={{ position: 'relative', fontSize: 12 }}>
-                          <span className={d.flagged ? 'danger' : 'muted'} style={{ marginRight: 14 }}>{d.flagged ? `${d.flagged} flagged` : 'ok'}</span>
-                          {(d.bytes / 1024).toFixed(1)} KB
-                        </span>
+                  <div className="section-hdr"><strong>Transport</strong><span className="muted" style={{ fontSize: 11 }}>EVENTS</span></div>
+                  {(() => {
+                    const dist = analyticsData?.transports || [];
+                    const total = dist.reduce((s, d) => s + d.count, 0) || 1;
+                    return dist.map(t => (
+                      <div key={t.transport} className="bar-row">
+                        <div className="bar-fill" style={{ width: `${Math.round((t.count / total) * 100)}%`, background: 'rgba(138,143,152,0.06)', borderLeft: '2px solid #636975' }} />
+                        <span style={{ position: 'relative' }}>{(t.transport || 'other').toUpperCase()}</span>
+                        <span className="sub" style={{ position: 'relative', fontSize: 12 }}>{t.count}</span>
                       </div>
-                    );
-                  })}
+                    ));
+                  })()}
+                </div>
+              </div>
+
+              <div className="split-grid">
+                <div style={{ padding: '18px 20px', borderRight: '1px solid #1c1f26' }}>
+                  <div className="section-hdr"><strong>Asset OS Classification</strong><span className="muted" style={{ fontSize: 11 }}>ASSETS</span></div>
+                  {(() => {
+                    const dist = analyticsData?.osBreakdown || [];
+                    const total = dist.reduce((s, d) => s + d.count, 0) || 1;
+                    return dist.map(o => (
+                      <div key={o.os_guess} className="bar-row">
+                        <div className="bar-fill" style={{ width: `${Math.round((o.count / total) * 100)}%`, background: 'rgba(45,212,191,0.06)', borderLeft: '2px solid #2dd4bf' }} />
+                        <span style={{ position: 'relative' }}>{o.os_guess}</span>
+                        <span className="sub" style={{ position: 'relative', fontSize: 12 }}>{o.count}</span>
+                      </div>
+                    ));
+                  })()}
+                </div>
+                <div style={{ padding: '18px 20px' }}>
+                  <div className="section-hdr"><strong>Top Source Endpoints</strong><span className="muted" style={{ fontSize: 11 }}>EVENTS</span></div>
+                  {(() => {
+                    const talkers = analyticsData?.topTalkers || [];
+                    const maxCount = Math.max(...talkers.map(t => t.event_count), 1);
+                    return talkers.map(t => {
+                      const asset = assets.find(a => a.asset_id === t.asset_id);
+                      const flagged = t.asset_id && alertedAssetIds.has(t.asset_id);
+                      const pct = Math.round((t.event_count / maxCount) * 100);
+                      return (
+                        <div key={t.ip} className="bar-row">
+                          <div className="bar-fill" style={{ width: `${pct}%`, background: flagged ? 'rgba(229,72,77,0.07)' : 'rgba(138,143,152,0.06)', borderLeft: `2px solid ${flagged ? '#e5484d' : '#636975'}` }} />
+                          <span style={{ position: 'relative' }}>{asset?.device_identity_hint || t.ip} <span className="muted" style={{ fontSize: 11.5, marginLeft: 4 }}>{t.ip}</span></span>
+                          <span style={{ position: 'relative', fontSize: 12 }}>
+                            <span className={flagged ? 'danger' : 'muted'} style={{ marginRight: 14 }}>{flagged ? 'flagged' : 'ok'}</span>
+                            {t.event_count} evts
+                          </span>
+                        </div>
+                      );
+                    });
+                  })()}
                 </div>
               </div>
             </div>
           )}
 
-          {/* PAGE 3: OVERVIEW */}
-          {page === 'OVERVIEW' && (
-            <>
-              <div className="section-hdr">
-                <strong>Packet Stream</strong>
-                <div style={{ display: 'flex', gap: 4 }}>
-                  {['ALL', 'SUSPICIOUS', 'DICOM', 'HL7'].map(f => (
-                    <button key={f} onClick={() => setFilter(f)} className={`pill-btn ${filter === f ? 'active' : ''}`} style={{ fontSize: 11 }}>{f}</button>
+          {/* PAGE: TRAFFIC ANALYSIS — full, server-filtered/searched/paginated events */}
+          {page === 'TRAFFIC' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div className="panel" style={{ padding: '14px 18px', display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+                <input
+                  placeholder="Search IP / MAC..."
+                  value={trafficFilters.search}
+                  onChange={(e) => setTrafficFilters(f => ({ ...f, search: e.target.value }))}
+                  style={{ flex: '1 1 220px', minWidth: 160 }}
+                />
+                <select value={trafficFilters.application} onChange={(e) => setTrafficFilters(f => ({ ...f, application: e.target.value }))}>
+                  <option value="">All protocols</option>
+                  {['dicom', 'hl7', 'http', 'https', 'dns', 'dhcp', 'ssh', 'rdp', 'smb', 'arp', 'icmp', 'ntp', 'snmp', 'mdns', 'ldap', 'syslog', 'ftp', 'telnet', 'smtp', 'unknown'].map(a => (
+                    <option key={a} value={a}>{a.toUpperCase()}</option>
                   ))}
-                </div>
+                </select>
+                <select value={trafficFilters.transport} onChange={(e) => setTrafficFilters(f => ({ ...f, transport: e.target.value }))}>
+                  <option value="">All transports</option>
+                  <option value="tcp">TCP</option>
+                  <option value="udp">UDP</option>
+                </select>
+                {(trafficFilters.search || trafficFilters.application || trafficFilters.transport) && (
+                  <button className="pill-btn" onClick={() => setTrafficFilters({ application: '', transport: '', search: '' })}>Clear filters</button>
+                )}
+                <span className="muted" style={{ fontSize: 11, marginLeft: 'auto' }}>{trafficTotal.toLocaleString()} packets matched</span>
               </div>
 
               <div className="panel">
                 <table>
-                  <thead><tr><th>State</th><th>Timestamp</th><th>Sensor</th><th>Source → Destination</th><th>Proto</th><th>Decoded Payload</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th>Time</th><th>Sensor</th><th>Protocol</th><th>Transport</th>
+                      <th>Source</th><th>Destination</th><th style={{ textAlign: 'right' }}>Bytes</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {filteredEvents.map(e => {
-                      const flow = `${e.src_ip}:${e.src_port ?? ''} → ${e.dst_ip}:${e.dst_port ?? ''}`;
-                      const flagged = isSuspiciousEvent(e);
-                      const meta = e.protocol_metadata;
-                      return (
-                        <tr key={e.event_id} className={`log-row ${flagged ? 'flagged' : ''}`} onClick={() => setModal({
-                          title: `Packet Inspection (${e.event_id})`,
-                          raw: `Sensor: ${e.sensor_id}\nFlow:   ${flow}\nBytes:  ${e.length_bytes || 512} B\n\n${JSON.stringify(meta, null, 2)}`
-                        })}>
-                          <td className={flagged ? 'danger' : 'sub'} style={{ fontSize: 11.5, borderLeft: flagged ? '2px solid #e5484d' : 'none' }}>{flagged ? 'Flagged' : 'Pass'}</td>
-                          <td className="muted" style={{ fontSize: 12 }}>{new Date(e["@timestamp"]).toLocaleTimeString([], { hour12: false })}</td>
-                          <td className="sub" style={{ fontSize: 12 }}>{e.sensor_id}</td>
-                          <td style={{ fontSize: 12 }}>{flow}</td>
-                          <td className="teal" style={{ fontSize: 11.5 }}>{e.application?.toUpperCase()}</td>
-                          <td className="muted" style={{ fontSize: 11.5, maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta ? JSON.stringify(meta) : '—'}</td>
-                        </tr>
-                      );
-                    })}
+                    {trafficRows.map(ev => (
+                      <tr key={ev.event_id}>
+                        <td className="mono-data" style={{ fontSize: 11.5 }}>{(ev['@timestamp'] || '').replace('T', ' ').slice(0, 19)}</td>
+                        <td className="sub">{ev.sensor_id}</td>
+                        <td><span className="badge badge-ok" style={{ fontSize: 10.5 }}>{(ev.application || 'unknown').toUpperCase()}</span></td>
+                        <td className="sub">{(ev.transport || '').toUpperCase()}</td>
+                        <td className="mono-data">{ev.src_ip}{ev.src_port ? `:${ev.src_port}` : ''}</td>
+                        <td className="mono-data">{ev.dst_ip}{ev.dst_port ? `:${ev.dst_port}` : ''}</td>
+                        <td style={{ textAlign: 'right' }} className="sub">{ev.length_bytes}</td>
+                      </tr>
+                    ))}
+                    {trafficRows.length === 0 && (
+                      <tr><td colSpan={7} className="muted" style={{ textAlign: 'center', padding: 24 }}>No packets match these filters</td></tr>
+                    )}
                   </tbody>
                 </table>
               </div>
-            </>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <button className="pill-btn" disabled={trafficPage === 0} onClick={() => setTrafficPage(p => Math.max(0, p - 1))}>Prev</button>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  Page {trafficPage + 1} of {Math.max(1, Math.ceil(trafficTotal / TRAFFIC_PAGE_SIZE))}
+                </span>
+                <button className="pill-btn" disabled={(trafficPage + 1) * TRAFFIC_PAGE_SIZE >= trafficTotal} onClick={() => setTrafficPage(p => p + 1)}>Next</button>
+              </div>
+            </div>
+          )}
+
+          {/* PAGE: SECURITY — violations + severity stats */}
+          {page === 'SECURITY' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+              <div>
+                <div className="section-hdr"><strong>Alert Severity Breakdown</strong><span className="muted" style={{ fontSize: 11 }}>all-time</span></div>
+                <div className="ledger">
+                  {['critical', 'warning', 'info'].map(sev => {
+                    const row = (securityData?.breakdown || []).find(b => b.severity === sev);
+                    return (
+                      <div key={sev} className="ledger-cell">
+                        <div className="sub" style={{ fontSize: 11 }}>{sev.toUpperCase()}</div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 6 }}>
+                          <span className={sev === 'critical' ? 'danger' : ''} style={{ fontSize: 19, fontWeight: 500, color: sev !== 'critical' ? '#e6e9ef' : undefined }}>{row?.count ?? 0}</span>
+                          <span className={sev === 'critical' && row?.count ? 'danger' : 'muted'} style={{ fontSize: 11 }}>alerts</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="ledger-cell">
+                    <div className="sub" style={{ fontSize: 11 }}>Flagged Assets</div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 6 }}>
+                      <span className={(securityData?.flaggedAssets?.length ?? 0) ? 'danger' : ''} style={{ fontSize: 19, fontWeight: 500, color: (securityData?.flaggedAssets?.length ?? 0) ? undefined : '#e6e9ef' }}>{securityData?.flaggedAssets?.length ?? 0}</span>
+                      <span className={(securityData?.flaggedAssets?.length ?? 0) ? 'danger' : 'muted'} style={{ fontSize: 11 }}>{(securityData?.flaggedAssets?.length ?? 0) ? 'needs review' : 'clear'}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="panel" style={{ padding: '18px 20px' }}>
+                <div className="section-hdr"><strong>Policy Violations Over Time</strong><span className="muted" style={{ fontSize: 11 }}>alerts raised per minute, all-time</span></div>
+                {(() => {
+                  const b = securityData?.violationsTimeseries || [];
+                  const maxB = Math.max(...b.map(x => x.count), 1);
+                  const pts = b.map((x, i) => ({ ...x, x: 36 + (b.length > 1 ? (i / (b.length - 1)) * 868 : 434), y: 14 + 125 - (x.count / maxB) * 125 }));
+                  const line = pts.map((p, i) => `${i ? 'L' : 'M'} ${p.x} ${p.y}`).join(' ');
+                  return (
+                    <svg viewBox="0 0 920 165" style={{ width: '100%', height: 175 }}>
+                      {pts.length > 1 && <path d={`${line} L ${pts.at(-1).x} 139 L ${pts[0].x} 139 Z`} fill="rgba(229,72,77,0.08)" />}
+                      {pts.length > 1 && <path d={line} fill="none" stroke="#e5484d" strokeWidth="1.5" />}
+                      {pts.map((p, i) => (
+                        <g key={i}>
+                          <circle cx={p.x} cy={p.y} r={2.5} fill="#0e1013" stroke="#e5484d" strokeWidth="1.5" />
+                          <text x={p.x} y="158" textAnchor="middle" fill="#636975" fontSize="9">{p.bucket?.slice(5, 16).replace('T', ' ')}</text>
+                        </g>
+                      ))}
+                      {pts.length === 0 && <text x="460" y="80" textAnchor="middle" fill="#636975" fontSize="12">No violations recorded</text>}
+                    </svg>
+                  );
+                })()}
+              </div>
+
+              <div>
+                <div className="section-hdr"><strong>Policy Violations</strong><span className="muted" style={{ fontSize: 11 }}>assets with active correlation alerts</span></div>
+                <div className="panel">
+                  {(securityData?.flaggedAssets || []).length === 0 && (
+                    <div className="muted" style={{ textAlign: 'center', padding: 32 }}>No active violations — fleet is clear.</div>
+                  )}
+                  {(securityData?.flaggedAssets || []).map(asset => (
+                    <div key={asset.asset_id} style={{ padding: '16px 20px', borderBottom: '1px solid #1c1f26' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                        <div>
+                          <strong>{asset.device_identity_hint || asset.asset_id}</strong>
+                          <span className="muted mono-data" style={{ fontSize: 11.5, marginLeft: 8 }}>{(asset.ip_addresses || []).join(', ')}</span>
+                        </div>
+                        <span className="sub" style={{ fontSize: 11 }}>{asset.os_guess}</span>
+                      </div>
+                      <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {asset.alerts.map(al => (
+                          <div key={al.alert_id} style={{ display: 'flex', gap: 10, alignItems: 'baseline', fontSize: 12.5 }}>
+                            <span className={`badge ${al.severity === 'critical' ? 'badge-danger' : al.severity === 'warning' ? 'badge-warn' : 'badge-muted'}`} style={{ fontSize: 10 }}>{al.severity.toUpperCase()}</span>
+                            <span>{al.message}</span>
+                            <span className="muted" style={{ fontSize: 10.5, marginLeft: 'auto', whiteSpace: 'nowrap' }}>{(al.created_at || '').replace('T', ' ').slice(0, 19)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* PAGE 3: OVERVIEW / DASHBOARD */}
+          {page === 'OVERVIEW' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+              {/* System status / uptime */}
+              <div>
+                <div className="section-hdr"><strong>System Status</strong><span className="muted" style={{ fontSize: 11 }}>backend + sensor fleet</span></div>
+                <div className="ledger">
+                  <div className="ledger-cell">
+                    <div className="sub" style={{ fontSize: 11 }}>Backend Uptime</div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 6 }}>
+                      <span style={{ fontSize: 19, fontWeight: 500, color: '#e6e9ef' }}>{formatUptime(systemHealth?.backend_uptime_seconds)}</span>
+                      <span className="teal" style={{ fontSize: 11 }}>online</span>
+                    </div>
+                  </div>
+                  <div className="ledger-cell">
+                    <div className="sub" style={{ fontSize: 11 }}>Sensor Fleet</div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 6 }}>
+                      <span style={{ fontSize: 19, fontWeight: 500, color: '#e6e9ef' }}>{systemHealth?.sensors_active ?? 0}/{systemHealth?.sensors_total ?? 0}</span>
+                      <span className="muted" style={{ fontSize: 11 }}>active</span>
+                    </div>
+                  </div>
+                  <div className="ledger-cell">
+                    <div className="sub" style={{ fontSize: 11 }}>Confirmed Assets</div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 6 }}>
+                      <span style={{ fontSize: 19, fontWeight: 500, color: '#e6e9ef' }}>{systemHealth?.confirmed_assets ?? 0}/{systemHealth?.total_assets ?? 0}</span>
+                      <span className="muted" style={{ fontSize: 11 }}>vetted</span>
+                    </div>
+                  </div>
+                  <div className="ledger-cell">
+                    <div className="sub" style={{ fontSize: 11 }}>Open Alerts</div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 6 }}>
+                      <span className={systemHealth?.open_alerts ? 'danger' : ''} style={{ fontSize: 19, fontWeight: 500, color: systemHealth?.open_alerts ? undefined : '#e6e9ef' }}>{systemHealth?.open_alerts ?? 0}</span>
+                      <span className={systemHealth?.open_alerts ? 'danger' : 'muted'} style={{ fontSize: 11 }}>{systemHealth?.open_alerts ? 'needs review' : 'clear'}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Live stream snippet — most recent events only, full log lives on... nowhere else, this IS the stream, just capped short here */}
+              <div>
+                <div className="section-hdr">
+                  <strong>Live Packet Stream</strong>
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                    {['ALL', 'SUSPICIOUS', 'DICOM', 'HL7', 'HTTP', 'HTTPS', 'DNS', 'ARP', 'ICMP', 'DHCP'].map(f => (
+                      <button key={f} onClick={() => setFilter(f)} className={`pill-btn ${filter === f ? 'active' : ''}`} style={{ fontSize: 11 }}>{f}</button>
+                    ))}
+                  </div>
+                </div>
+                <div className="panel">
+                  <table>
+                    <thead><tr><th>State</th><th>Timestamp</th><th>Sensor</th><th>Source → Destination</th><th>Proto</th><th>Decoded Payload</th></tr></thead>
+                    <tbody>
+                      {filteredEvents.slice(0, 12).map(e => {
+                        const flow = `${e.src_ip}${e.src_port ? ':' + e.src_port : ''} → ${e.dst_ip}${e.dst_port ? ':' + e.dst_port : ''}`;
+                        const flagged = isSuspiciousEvent(e);
+                        const meta = e.protocol_metadata;
+                        return (
+                          <tr key={e.event_id} className={`log-row ${flagged ? 'flagged' : ''}`} onClick={() => setModal({
+                            title: `Packet Inspection (${e.event_id})`,
+                            raw: `Sensor: ${e.sensor_id}\nFlow:   ${flow}\nBytes:  ${e.length_bytes || 512} B\n\n${JSON.stringify(meta, null, 2)}`
+                          })}>
+                            <td className={flagged ? 'danger' : 'sub'} style={{ fontSize: 11.5, borderLeft: flagged ? '2px solid #e5484d' : 'none' }}>
+                              <span className={`badge ${flagged ? 'badge-danger' : 'badge-ok'}`}>{flagged ? 'Flagged' : 'Pass'}</span>
+                            </td>
+                            <td className="muted" style={{ fontSize: 12 }}>{new Date(e["@timestamp"]).toLocaleTimeString([], { hour12: false })}</td>
+                            <td className="sub" style={{ fontSize: 12 }}>{e.sensor_id}</td>
+                            <td className="mono-data" style={{ fontSize: 12 }}>{flow}</td>
+                            <td className="teal" style={{ fontSize: 11.5 }}>{e.application?.toUpperCase()}</td>
+                            <td className="muted" style={{ fontSize: 11.5, maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta ? JSON.stringify(meta) : '—'}</td>
+                          </tr>
+                        );
+                      })}
+                      {filteredEvents.length === 0 && (
+                        <tr><td colSpan={6} className="muted" style={{ fontSize: 12, textAlign: 'center', padding: 20 }}>No packets seen yet — waiting for sensor traffic.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                  {filteredEvents.length > 12 && (
+                    <div className="muted" style={{ fontSize: 11, textAlign: 'center', padding: '8px 0' }}>
+                      showing latest 12 of {filteredEvents.length} — see <span className="teal" style={{ cursor: 'pointer' }} onClick={() => setPage('ANALYTICS')}>Traffic Analytics</span> for full history
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* At-a-glance analytics snapshot */}
+              <div className="split-grid">
+                <div style={{ padding: '18px 20px', borderRight: '1px solid #1c1f26' }}>
+                  <div className="section-hdr"><strong>Protocol Mix</strong><span className="muted" style={{ fontSize: 11 }}>last {sensorEvents.length} pkts</span></div>
+                  {analytics.protocols.slice(0, 8).map(p => (
+                    <div key={p.name} className="bar-row">
+                      <div className="bar-fill" style={{ width: `${p.pct}%`, background: 'rgba(45,212,191,0.06)', borderLeft: '2px solid #2dd4bf' }} />
+                      <span style={{ position: 'relative' }}>{p.name}</span>
+                      <span className="sub" style={{ position: 'relative', fontSize: 12 }}>{p.count}</span>
+                    </div>
+                  ))}
+                  {analytics.protocols.length === 0 && <div className="muted" style={{ fontSize: 12, padding: '10px 0' }}>No traffic yet.</div>}
+                </div>
+                <div style={{ padding: '18px 20px' }}>
+                  <div className="section-hdr"><strong>Top Talkers</strong><span className="muted" style={{ fontSize: 11 }}>by volume</span></div>
+                  {analytics.topTalkers.slice(0, 8).map(t => (
+                    <div key={t.ip} className="bar-row">
+                      <div className="bar-fill" style={{ width: `${Math.round((t.bytes / (analytics.topTalkers[0]?.bytes || 1)) * 100)}%`, background: t.flagged ? 'rgba(229,72,77,0.07)' : 'rgba(138,143,152,0.06)', borderLeft: `2px solid ${t.flagged ? '#e5484d' : '#636975'}` }} />
+                      <span style={{ position: 'relative' }}>{t.name}</span>
+                      <span className="sub" style={{ position: 'relative', fontSize: 12 }}>{(t.bytes / 1024).toFixed(1)} KB</span>
+                    </div>
+                  ))}
+                  {analytics.topTalkers.length === 0 && <div className="muted" style={{ fontSize: 12, padding: '10px 0' }}>No traffic yet.</div>}
+                </div>
+              </div>
+            </div>
           )}
         </div>
       </main>

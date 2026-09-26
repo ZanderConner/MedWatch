@@ -4,7 +4,7 @@
 //! async), forwarding parsed packets to the async pipeline over a channel.
 
 use anyhow::{Context, Result};
-use etherparse::{LinkHeader, NetHeaders, PacketHeaders, TransportHeader};
+use etherparse::{LinkHeader, NetHeaders, PacketHeaders, TcpOptionElement, TransportHeader};
 use pcap::{Capture, Device, Linktype};
 use std::net::IpAddr;
 use tokio::sync::mpsc;
@@ -30,9 +30,97 @@ pub struct CapturedPacket {
     pub window_size: Option<u16>,
     pub is_syn: bool,
     pub is_syn_ack: bool,
+    /// TCP maximum-segment-size option, when present. `None` for non-TCP
+    /// packets or a TCP packet that carried no MSS option.
+    pub mss: Option<u16>,
+    /// TCP window-scale option value, when present.
+    pub window_scale: Option<u8>,
+    /// True if the SACK-permitted option was present.
+    pub sack_permitted: bool,
+    /// True if the timestamps option was present.
+    pub timestamps_present: bool,
+    /// Options in the order they appeared on the wire, e.g.
+    /// "MSS,SACK,TS,NOP,WS" — used by the passive OS fingerprinter
+    /// alongside TTL/window size (see `medwatch_fingerprinting::classify`).
+    /// Empty for non-TCP packets.
+    pub tcp_option_order: String,
     pub total_len: u32,
     pub raw_payload: Vec<u8>,
+    /// Set for ARP request/reply frames (Ethernet/IPv4 ARP only — the
+    /// vast majority of what's seen on a real LAN). `src_ip`/`dst_ip`
+    /// carry the ARP sender/target protocol addresses in this case;
+    /// `src_port`/`dst_port` are always None and `transport` is
+    /// `Other`, since ARP has no L4 concept of ports. Kept as a flag on
+    /// the same struct (rather than a separate packet type) so the rest
+    /// of the pipeline — flow keys, asset observation, event shipping —
+    /// doesn't need a second code path.
+    pub is_arp: bool,
 }
+
+/// Parse an Ethernet/IPv4 ARP packet's payload (the 28 bytes after the
+/// 14-byte Ethernet header + 2-byte ethertype): hw_type(2) proto_type(2)
+/// hw_len(1) proto_len(1) opcode(2) sender_mac(6) sender_ip(4)
+/// target_mac(6) target_ip(4). Returns None for anything that isn't a
+/// standard Ethernet/IPv4 ARP frame (hw_len=6, proto_len=4) — other ARP
+/// hardware/protocol combinations are vanishingly rare on a real LAN
+/// and not worth the extra complexity here.
+fn parse_arp_payload(payload: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    if payload.len() < 28 {
+        return None;
+    }
+    let hw_len = payload[4];
+    let proto_len = payload[5];
+    if hw_len != 6 || proto_len != 4 {
+        return None;
+    }
+    let sender_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+        payload[14],
+        payload[15],
+        payload[16],
+        payload[17],
+    ));
+    let target_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+        payload[24],
+        payload[25],
+        payload[26],
+        payload[27],
+    ));
+    Some((sender_ip, target_ip))
+}
+
+fn arp_captured_packet(
+    payload: &[u8],
+    src_mac: Option<String>,
+    dst_mac: Option<String>,
+    frame_len: usize,
+    timestamp_micros: i64,
+) -> Option<CapturedPacket> {
+    let (src_ip, dst_ip) = parse_arp_payload(payload)?;
+    Some(CapturedPacket {
+        timestamp_micros,
+        src_ip,
+        dst_ip,
+        src_port: None,
+        dst_port: None,
+        src_mac,
+        dst_mac,
+        transport: TransportProtocol::Other,
+        ttl: None,
+        window_size: None,
+        is_syn: false,
+        is_syn_ack: false,
+        mss: None,
+        window_scale: None,
+        sack_permitted: false,
+        timestamps_present: false,
+        tcp_option_order: String::new(),
+        total_len: frame_len as u32,
+        raw_payload: payload.to_vec(),
+        is_arp: true,
+    })
+}
+
+const ETHERTYPE_ARP: u16 = 0x0806;
 
 pub fn list_interfaces() -> Result<Vec<Device>> {
     Device::list().context("listing capture devices (are you root/Administrator?)")
@@ -49,6 +137,26 @@ fn mac_to_string(mac: [u8; 6]) -> String {
 /// non-IP / unparseable frames (ARP, STP, malformed, etc — still useful for
 /// asset discovery via ARP in a future pass, but out of scope here).
 pub fn parse_frame(data: &[u8], timestamp_micros: i64) -> Option<CapturedPacket> {
+    // Ethernet header is 14 bytes (6 dst mac + 6 src mac + 2 ethertype);
+    // check the ethertype directly for ARP before handing off to
+    // etherparse's IP-oriented parser, which has no ARP support.
+    if data.len() >= 14 {
+        let ethertype = u16::from_be_bytes([data[12], data[13]]);
+        if ethertype == ETHERTYPE_ARP {
+            let src_mac = Some(mac_to_string([
+                data[6], data[7], data[8], data[9], data[10], data[11],
+            ]));
+            let dst_mac = Some(mac_to_string([
+                data[0], data[1], data[2], data[3], data[4], data[5],
+            ]));
+            if let Some(pkt) =
+                arp_captured_packet(&data[14..], src_mac, dst_mac, data.len(), timestamp_micros)
+            {
+                return Some(pkt);
+            }
+        }
+    }
+
     let headers = match PacketHeaders::from_ethernet_slice(data) {
         Ok(h) => h,
         Err(e) => {
@@ -103,6 +211,14 @@ fn parse_sll_frame(data: &[u8], timestamp_micros: i64) -> Option<CapturedPacket>
     let ether_type = u16::from_be_bytes([data[14], data[15]]);
     let inner = &data[16..];
 
+    if ether_type == ETHERTYPE_ARP {
+        if let Some(pkt) =
+            arp_captured_packet(inner, src_mac.clone(), None, data.len(), timestamp_micros)
+        {
+            return Some(pkt);
+        }
+    }
+
     let headers = match PacketHeaders::from_ether_type(etherparse::EtherType(ether_type), inner) {
         Ok(h) => h,
         Err(e) => {
@@ -152,6 +268,11 @@ fn build_captured_packet(
     let mut is_syn = false;
     let mut is_syn_ack = false;
     let mut transport = TransportProtocol::Other;
+    let mut mss = None;
+    let mut window_scale = None;
+    let mut sack_permitted = false;
+    let mut timestamps_present = false;
+    let mut tcp_option_order = String::new();
 
     match &transport_hdr {
         Some(TransportHeader::Tcp(tcp)) => {
@@ -161,6 +282,39 @@ fn build_captured_packet(
             window_size = Some(tcp.window_size);
             is_syn = tcp.syn && !tcp.ack;
             is_syn_ack = tcp.syn && tcp.ack;
+
+            // Only worth decoding options for the packets the passive OS
+            // fingerprinter actually looks at (SYN/SYN-ACK) — parsing every
+            // data packet's options would be wasted work on the hot path.
+            if is_syn || is_syn_ack {
+                let mut order_parts = Vec::new();
+                for opt in tcp.options_iterator() {
+                    match opt {
+                        Ok(TcpOptionElement::MaximumSegmentSize(v)) => {
+                            mss = Some(v);
+                            order_parts.push("MSS");
+                        }
+                        Ok(TcpOptionElement::WindowScale(v)) => {
+                            window_scale = Some(v);
+                            order_parts.push("WS");
+                        }
+                        Ok(TcpOptionElement::SelectiveAcknowledgementPermitted) => {
+                            sack_permitted = true;
+                            order_parts.push("SACK");
+                        }
+                        Ok(TcpOptionElement::Timestamp(_, _)) => {
+                            timestamps_present = true;
+                            order_parts.push("TS");
+                        }
+                        Ok(TcpOptionElement::Noop) => order_parts.push("NOP"),
+                        // A malformed/unrecognized option ends decoding for
+                        // the rest of this header — same as p0f, since option
+                        // boundaries can't be trusted past that point.
+                        Ok(TcpOptionElement::SelectiveAcknowledgement(_, _)) | Err(_) => break,
+                    }
+                }
+                tcp_option_order = order_parts.join(",");
+            }
         }
         Some(TransportHeader::Udp(udp)) => {
             transport = TransportProtocol::Udp;
@@ -186,8 +340,14 @@ fn build_captured_packet(
         window_size,
         is_syn,
         is_syn_ack,
+        mss,
+        window_scale,
+        sack_permitted,
+        timestamps_present,
+        tcp_option_order,
         total_len: frame_len as u32,
         raw_payload: payload.to_vec(),
+        is_arp: false,
     })
 }
 
@@ -329,10 +489,122 @@ mod tests {
         // SLL has no destination MAC by construction.
         assert_eq!(parsed.dst_mac, None);
         assert_eq!(parsed.raw_payload, b"test");
+        assert!(!parsed.is_arp);
     }
 
     #[test]
     fn rejects_too_short_sll_frame() {
         assert!(parse_sll_frame(&[0u8; 10], 0).is_none());
+    }
+
+    /// Builds a minimal Ethernet/IPv4 ARP request frame (dst mac
+    /// broadcast, ethertype 0x0806) matching the wire format seen on a
+    /// real LAN — this is the primary source of asset-discovery
+    /// evidence for hosts that never send a single TCP/UDP packet
+    /// (e.g. a device that's up but idle beyond periodic ARP refresh).
+    fn arp_request_frame(src_mac: [u8; 6], sender_ip: [u8; 4], target_ip: [u8; 4]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]); // dst mac: broadcast
+        frame.extend_from_slice(&src_mac); // src mac
+        frame.extend_from_slice(&0x0806u16.to_be_bytes()); // ethertype: ARP
+
+        frame.extend_from_slice(&1u16.to_be_bytes()); // hw_type: ethernet
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // proto_type: IPv4
+        frame.push(6); // hw_len
+        frame.push(4); // proto_len
+        frame.extend_from_slice(&1u16.to_be_bytes()); // opcode: request
+        frame.extend_from_slice(&src_mac); // sender mac
+        frame.extend_from_slice(&sender_ip); // sender ip
+        frame.extend_from_slice(&[0u8; 6]); // target mac: unknown (request)
+        frame.extend_from_slice(&target_ip); // target ip
+        frame
+    }
+
+    #[test]
+    fn parses_arp_request_frame() {
+        let src_mac = [0x02, 0x42, 0x0a, 0x14, 0x46, 0x0a];
+        let frame = arp_request_frame(src_mac, [10, 20, 70, 10], [10, 20, 70, 1]);
+
+        let parsed = parse_frame(&frame, 1_000_000).expect("ARP frame should parse");
+
+        assert!(parsed.is_arp);
+        assert_eq!(parsed.src_ip.to_string(), "10.20.70.10");
+        assert_eq!(parsed.dst_ip.to_string(), "10.20.70.1");
+        assert_eq!(parsed.src_mac.as_deref(), Some("02:42:0a:14:46:0a"));
+        assert_eq!(parsed.src_port, None);
+        assert_eq!(parsed.transport, TransportProtocol::Other);
+    }
+
+    /// Builds a real Ethernet/IPv4/TCP SYN frame carrying a genuine set of
+    /// TCP options (MSS, SACK-permitted, timestamps, NOP padding, window
+    /// scale — a realistic modern Linux/BSD SYN) via etherparse's own
+    /// `PacketBuilder`, so this test exercises the exact wire encoding a
+    /// real OS's TCP stack produces, not a hand-rolled byte buffer.
+    #[test]
+    fn parses_real_tcp_options_from_syn_packet() {
+        use etherparse::{PacketBuilder, TcpHeader, TcpOptionElement};
+
+        let mut tcp_header = TcpHeader::new(51000, 4242, 0, 29200);
+        tcp_header.syn = true;
+        tcp_header.set_options(&[
+            TcpOptionElement::MaximumSegmentSize(1460),
+            TcpOptionElement::SelectiveAcknowledgementPermitted,
+            TcpOptionElement::Timestamp(123_456, 0),
+            TcpOptionElement::Noop,
+            TcpOptionElement::WindowScale(7),
+        ])
+        .expect("options fit within the 40-byte TCP options budget");
+
+        let builder = PacketBuilder::ethernet2([0x02, 0x42, 0x0a, 0x14, 0x46, 0x0a], [0x02, 0x42, 0x0a, 0x14, 0x46, 0x01])
+            .ipv4([10, 20, 70, 21], [10, 20, 70, 10], 64)
+            .tcp_header(tcp_header);
+
+        let mut frame = Vec::with_capacity(builder.size(0));
+        builder
+            .write(&mut frame, &[])
+            .expect("valid packet builder configuration");
+
+        let parsed = parse_frame(&frame, 1_000_000).expect("real TCP SYN frame should parse");
+
+        assert!(parsed.is_syn);
+        assert!(!parsed.is_syn_ack);
+        assert_eq!(parsed.mss, Some(1460));
+        assert_eq!(parsed.window_scale, Some(7));
+        assert!(parsed.sack_permitted);
+        assert!(parsed.timestamps_present);
+        assert_eq!(parsed.tcp_option_order, "MSS,SACK,TS,NOP,WS");
+        assert_eq!(parsed.ttl, Some(64));
+    }
+
+    /// A device with a minimal TCP option set (no window scale, no
+    /// timestamps, no SACK — real embedded/IoT TCP/IP stacks like lwIP
+    /// commonly send exactly this) must still parse cleanly and report
+    /// those fields as genuinely absent, not just defaulted — this is
+    /// what lets `medwatch_fingerprinting::classify` tell a real minimal
+    /// stack apart from a modern one that simply wasn't decoded.
+    #[test]
+    fn parses_minimal_tcp_options_from_embedded_style_syn() {
+        use etherparse::{PacketBuilder, TcpHeader, TcpOptionElement};
+
+        let mut tcp_header = TcpHeader::new(50000, 104, 0, 2048);
+        tcp_header.syn = true;
+        tcp_header
+            .set_options(&[TcpOptionElement::MaximumSegmentSize(536)])
+            .expect("single MSS option fits");
+
+        let builder = PacketBuilder::ethernet2([0x02, 0x42, 0x0a, 0x14, 0x50, 0x0a], [0x02, 0x42, 0x0a, 0x14, 0x50, 0x01])
+            .ipv4([10, 20, 80, 22], [10, 20, 80, 12], 64)
+            .tcp_header(tcp_header);
+
+        let mut frame = Vec::with_capacity(builder.size(0));
+        builder.write(&mut frame, &[]).expect("valid packet builder configuration");
+
+        let parsed = parse_frame(&frame, 1_000_000).expect("minimal TCP SYN frame should parse");
+
+        assert_eq!(parsed.mss, Some(536));
+        assert_eq!(parsed.window_scale, None);
+        assert!(!parsed.sack_permitted);
+        assert!(!parsed.timestamps_present);
+        assert_eq!(parsed.tcp_option_order, "MSS");
     }
 }

@@ -108,3 +108,21 @@ td { padding: 10px 14px; font-weight: 400; }
 .sub { color: #8b919d; }
 .teal { color: #2dd4bf; }
 .danger { color: #e5484d; }
+
+/* Status/severity badges — pill-style, filled background (industry
+   SOC-dashboard convention: Security Onion, most EDR/asset-mgmt tools
+   render state as a filled badge, not just colored text) */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.03em; line-height: 1.4;
+}
+.badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.badge-ok { background: rgba(45,212,191,0.10); color: #2dd4bf; }
+.badge-warn { background: rgba(245,166,35,0.12); color: #f5a623; }
+.badge-danger { background: rgba(229,72,77,0.12); color: #e5484d; }
+.badge-muted { background: rgba(139,145,157,0.10); color: #8b919d; }
+
+/* Monospace for identifiers/addresses — standard in asset-inventory and
+   packet-inspection tooling so columns of IPs/MACs/hex align cleanly. */
+.mono-data { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; letter-spacing: -0.01em; }

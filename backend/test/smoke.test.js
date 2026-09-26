@@ -78,10 +78,14 @@ test('ingest + read API smoke test', () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].application, 'dicom');
 
-  // Correlation: the embedded-or-iot asset exposes port 22 -> should fire.
+  // Correlation: the embedded-or-iot asset exposes port 22 -> fires the
+  // remote-admin rule; its AE title "DICOMSIM" also isn't in the demo
+  // range's known-good AE title list -> fires the unrecognized-DICOM-
+  // initiator rule too. Two distinct rules, both legitimately matching.
   const alerts = runCorrelation(db);
-  assert.equal(alerts.length, 1);
-  assert.equal(alerts[0].rule, 'embedded_device_exposing_remote_admin');
+  assert.equal(alerts.length, 2);
+  const rules = alerts.map((a) => a.rule).sort();
+  assert.deepEqual(rules, ['embedded_device_exposing_remote_admin', 'unrecognized_dicom_initiator']);
 
   // Sensors/stats.
   const sensors = listSensors(db);

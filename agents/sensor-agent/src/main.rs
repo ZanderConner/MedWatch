@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use capture::CapturedPacket;
 use config::{Cli, Config};
 use events::{AssetRecord, NetworkEvent};
-use pipeline::{extract_identity_hint, packet_to_event, AssetTable};
+use pipeline::{extract_identity_hint, packet_to_event, AssetTable, FlowClassifier, ProtocolPorts};
 use shipper::BackendShipper;
 
 fn init_tracing() {
@@ -75,6 +75,8 @@ async fn main() -> Result<()> {
 
     let mut asset_table = AssetTable::new();
     let mut event_buffer: Vec<NetworkEvent> = Vec::new();
+    let protocol_ports = ProtocolPorts::new(&config.capture.dicom_ports, &config.capture.hl7_ports);
+    let mut flow_classifier = FlowClassifier::default();
 
     let mut flush_ticker = interval(Duration::from_secs(config.backend.flush_interval_secs));
     let mut asset_ticker = interval(Duration::from_secs(
@@ -88,7 +90,7 @@ async fn main() -> Result<()> {
             maybe_packet = rx.recv() => {
                 match maybe_packet {
                     Some(packet) => {
-                        let event = packet_to_event(&packet, &sensor_id);
+                        let event = packet_to_event(&packet, &sensor_id, &protocol_ports, &mut flow_classifier);
                         let identity_hint = extract_identity_hint(&event.application, &event.protocol_metadata);
                         asset_table.observe(&packet, &event.application, identity_hint);
                         event_buffer.push(event);

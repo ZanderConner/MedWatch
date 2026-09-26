@@ -41,6 +41,10 @@ const ManualAssetSchema = z.object({
 const AssetPatchSchema = z.object({
   confirmed: z.boolean().optional(),
   device_identity_hint: z.string().max(200).nullable().optional(),
+  os_guess: z.enum(OS_GUESSES).optional(),
+  ip_addresses: z.array(z.string()).optional(),
+  mac_address: z.string().nullable().optional(),
+  notes: z.string().max(2000).nullable().optional(),
 });
 
 // GET /api/v1/admin/sensors
