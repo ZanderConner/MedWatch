@@ -1,0 +1,29 @@
+# MedWatch sensor-agent default configuration.
+# Copy to /etc/medwatch/sensor-agent.toml (Linux) or
+# C:\ProgramData\MedWatch\sensor-agent.toml (Windows) and edit.
+
+[sensor]
+# Leave unset to fall back to the OS hostname.
+# id = "sensor-icu-3rdfloor"
+site = "unset-site"
+
+[capture]
+# Linux: interface name, e.g. "eth0". Run with --list-interfaces to see options.
+# Windows: Npcap device name as reported by --list-interfaces (looks like
+# "\Device\NPF_{GUID}") — copy it exactly from that output.
+interface = "eth0"
+snaplen = 262144
+promiscuous = true
+# Exclude the sensor's own SSH/WinRM management traffic from capture.
+bpf_filter = "not port 22 and not port 3389"
+asset_flush_interval_secs = 60
+
+# Ships to the team's backend ingest API (JSON array POST to
+# {url}/api/v1/events and {url}/api/v1/assets, Authorization: ApiKey
+# <key> header) — NOT directly to Elasticsearch.
+[backend]
+url = "https://medwatch-backend.example.internal:8443"
+api_key = "change-me"
+batch_size = 500
+flush_interval_secs = 5
+verify_tls = true
