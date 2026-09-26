@@ -17,11 +17,10 @@ promiscuous = true
 bpf_filter = "not port 22"
 asset_flush_interval_secs = 60
 
-# The team's backend ingest API isn't built yet (backend/ is still an
-# empty scaffold) — dry_run below means the agent captures, parses, and
-# fingerprints for real but only logs counts instead of POSTing anywhere.
-# Flip dry_run off (drop --dry-run from the compose command) once
-# POST /api/v1/events and /api/v1/assets exist on the siem service.
+# The backend (backend/) is live in this range as the "siem" service on
+# agent_siem_net. api_key must match the backend's MEDWATCH_API_KEY env
+# var (set in demo/docker-compose.yml's backend service) — both are
+# "change-me" for this demo range, update both together if you change it.
 [backend]
 url = "http://siem:8080"
 api_key = "change-me"

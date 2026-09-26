@@ -3,3 +3,7 @@
 .git
 demo/**/data
 *.md
+backend/node_modules
+backend/data
+backend/.env
+

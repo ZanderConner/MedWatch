@@ -342,11 +342,12 @@ services:
       - NET_RAW
     environment:
       LAB_ROLE: monitoring-agent
-    # Real MedWatch sensor agent (agents/sensor-agent). --dry-run because
-    # the siem service doesn't expose a real ingest API yet (backend/ is
-    # still an empty scaffold) — the agent captures/parses/fingerprints
-    # for real and logs counts instead of POSTing. Drop --dry-run once
-    # POST /api/v1/events and /api/v1/assets exist on siem:8080.
+    # Real MedWatch sensor agent (agents/sensor-agent), shipping to the
+    # real backend (backend/, built via backend/Dockerfile, container
+    # "siem" below on agent_siem_net) — --dry-run is OFF now that the
+    # backend actually exists and implements POST /api/v1/events and
+    # /api/v1/assets. api_key in sensor-agent.toml must match this
+    # backend's MEDWATCH_API_KEY env var below.
     #
     # NOTE: bridge-attached like this (interface "any" on its own veth),
     # the agent only sees ITS OWN traffic plus broadcast/multicast — a
@@ -364,8 +365,10 @@ services:
         "/etc/medwatch/sensor-agent.toml",
         "--interface",
         "any",
-        "--dry-run",
       ]
+    depends_on:
+      backend:
+        condition: service_started
     volumes:
       - ./range/monitoring-agent/sensor-agent.toml:/etc/medwatch/sensor-agent.toml:ro
     networks:
@@ -375,22 +378,22 @@ services:
         ipv4_address: 10.20.60.20
     restart: unless-stopped
 
-  siem:
+  backend:
     build:
-      context: ./range/host
+      context: ..
+      dockerfile: backend/Dockerfile
     container_name: siem
     hostname: siem
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
     environment:
-      LAB_ROLE: siem
-    # Blank placeholder: holds this container's hostname/IPs/network
-    # attachments in the range topology for the real SIEM, not yet
-    # implemented. Replace this command with the real SIEM's entrypoint
-    # when it's integrated. The one-line route fixup (no script file) keeps
-    # `docker compose exec siem probe-range` able to reach routed segments.
-    command: ["sh", "-c", "ip route replace default via 10.20.40.1; sleep infinity"]
+      PORT: "8080"
+      MEDWATCH_API_KEY: change-me
+      MEDWATCH_DB_PATH: /app/data/medwatch.sqlite
+    # Real MedWatch backend (backend/), replacing the old placeholder
+    # "siem" sleep-infinity container. Kept the container_name/hostname
+    # "siem" and the same network/IP/port layout so nothing else in the
+    # range (monitoring-agent's backend.url, port mapping, route fixups)
+    # needed to change — this container just now runs the real ingest +
+    # read API instead of doing nothing.
     depends_on:
       router:
         condition: service_started
@@ -402,7 +405,7 @@ services:
       agent_siem_net:
         ipv4_address: 10.20.60.10
     volumes:
-      - siem-data:/var/log/medsim-siem
+      - siem-data:/app/data
     restart: unless-stopped
 
   openemr-seed:

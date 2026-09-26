@@ -63,17 +63,24 @@ router.get('/assets', (req, res) => {
   const limit = clampLimit(req.query.limit, 100, 1000);
   const offset = Number(req.query.offset) || 0;
 
-  let rows = db
-    .prepare('SELECT * FROM assets ORDER BY last_seen DESC LIMIT ? OFFSET ?')
-    .all(limit, offset)
-    .map(rowToAsset);
-
+  const clauses = [];
+  const params = [];
   if (req.query.os_guess) {
-    rows = rows.filter((a) => a.os_guess === req.query.os_guess);
+    clauses.push('os_guess = ?');
+    params.push(req.query.os_guess);
   }
   if (req.query.protocol) {
-    rows = rows.filter((a) => a.observed_protocols.includes(req.query.protocol));
+    // observed_protocols is a JSON array column; json_each unnests it
+    // so the filter runs in SQL (before LIMIT/OFFSET), not after.
+    clauses.push('EXISTS (SELECT 1 FROM json_each(observed_protocols) WHERE value = ?)');
+    params.push(req.query.protocol);
   }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  const rows = db
+    .prepare(`SELECT * FROM assets ${where} ORDER BY last_seen DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset)
+    .map(rowToAsset);
 
   res.json({ assets: rows, limit, offset });
 });

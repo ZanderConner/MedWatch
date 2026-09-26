@@ -51,11 +51,11 @@ function runCorrelation(db = getDb()) {
       observed_protocols: parseJsonArrayColumn(row.observed_protocols),
     }));
 
-  const newAlerts = [];
+  const candidates = [];
   for (const asset of assets) {
     for (const rule of RULES) {
       if (rule.matches(asset)) {
-        newAlerts.push({
+        candidates.push({
           alert_id: crypto.randomUUID(),
           asset_id: asset.asset_id,
           rule: rule.name,
@@ -66,13 +66,15 @@ function runCorrelation(db = getDb()) {
     }
   }
 
-  if (newAlerts.length > 0) {
+  // Only alerts actually inserted (i.e. genuinely new — no existing
+  // (asset_id, rule) alert yet) are returned. Without this, a rule that
+  // keeps matching on every periodic pass (see server.js) would be
+  // reported as "new" every time, even though nothing changed.
+  const insertedAlerts = [];
+  if (candidates.length > 0) {
     db.exec('BEGIN');
     try {
-      for (const alert of newAlerts) {
-        // Avoid re-inserting an identical (asset_id, rule) alert on every
-        // correlation pass — only insert if this exact pair isn't already
-        // the most recent alert for that asset+rule.
+      for (const alert of candidates) {
         const existing = db
           .prepare(
             'SELECT 1 FROM alerts WHERE asset_id = ? AND rule = ? ORDER BY created_at DESC LIMIT 1'
@@ -82,6 +84,7 @@ function runCorrelation(db = getDb()) {
         db.prepare(
           'INSERT INTO alerts (alert_id, asset_id, rule, severity, message) VALUES (?, ?, ?, ?, ?)'
         ).run(alert.alert_id, alert.asset_id, alert.rule, alert.severity, alert.message);
+        insertedAlerts.push(alert);
       }
       db.exec('COMMIT');
     } catch (err) {
@@ -90,7 +93,7 @@ function runCorrelation(db = getDb()) {
     }
   }
 
-  return newAlerts;
+  return insertedAlerts;
 }
 
 module.exports = { runCorrelation, RULES };

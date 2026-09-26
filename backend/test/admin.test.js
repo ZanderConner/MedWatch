@@ -88,6 +88,18 @@ test('admin sensor page: label/retire/detail/purge', () => {
   assert.equal(getSensorDetail('sensor-b', db), null);
 });
 
+test('runCorrelation only returns genuinely new alerts, not re-matches', () => {
+  migrate(getDb());
+  const db = getDb();
+  seed(db);
+
+  const second = runCorrelation(db);
+  assert.equal(second.length, 0, 'a second pass with no asset changes should report 0 new alerts');
+
+  const totalAlerts = db.prepare('SELECT COUNT(*) AS c FROM alerts').get().c;
+  assert.equal(totalAlerts, 2, 'alerts table should still only have the 2 alerts from the first pass');
+});
+
 test('unknown sensor_id returns null detail', () => {
   migrate(getDb());
   const detail = getSensorDetail('does-not-exist', getDb());
