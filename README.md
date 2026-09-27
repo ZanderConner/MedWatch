@@ -123,3 +123,36 @@ MedWatch is a passive IT management and security platform for Medical IoT device
 ## Tagline
 
 Passive security visibility for Medical IoT networks.
+
+## Prior Research
+
+Medical device cybersecurity is a complex, multifaceted domain where the balance between clinical utility, patient safety, and information security presents significant challenges. Literature across multiple studies emphasizes that medical systems often operate within highly vulnerable environments due to a combination of architectural limitations, systemic software flaws, and supply chain dependencies.
+
+Key Contributing Factors & Systemic Issues
+**Legacy Infrastructure and Patching:** Many healthcare systems rely on legacy operating systems and software that are five or more years old. Timely patching and updates are complex because updates require manufacturer input to ensure patient care is not disrupted.
+
+**Design Paradigm (Safety vs. Security):** Medical devices have traditionally been designed with a primary focus on physical safety and preventing operational malfunctions, leading developers to falsely assume that network communications are inherently trusted.
+
+**Resource Constraints:** Due to the limited power and computational resources of many medical devices, applying standard encryption can degrade device performance and reduce usable battery life. Furthermore, financial and resource limitations often prevent organizations from properly supporting complex IT security environments.
+
+**Supply Chain Vulnerabilities:** Attackers frequently bypass hardened hospital networks by targeting third-party vendors with weaker security defenses, utilizing a "hub and spoke" strategy to pivot across interconnected healthcare providers.
+
+**Extended Exposure Windows:** Capital-intensive equipment (such as MRIs) remains in service much longer than traditional IT software. Additionally, a significant average time gap (approximately 3.2 years) often exists between a hospital purchasing a device and a vulnerability being publicly announced, leaving a massive window for zero-day exploits.
+
+Core Vulnerabilities & Impacts
+
+**CIA Triad Compromises:**
+
+**Confidentiality:** Poor access control measures lead to unauthorized data exposure impacting HIPAA compliance and risking reputational or financial consequences.
+Integrity: Poor configurations, corrupted data, and unauthorized manipulation of device settings (such as altering computed tomography / radiator doses or drug dosages on insulin pumps) directly threaten patient safety and clinical decision-making.
+
+**Availability:** Limited or lost access to data and devices can prevent clinicians from receiving critical alerts or vital information in a timely manner.
+  
+**Widespread Software Weaknesses (CWEs):** Common technical flaws identified across studies include hard-coded credentials (CWE-798), lack of or improper authentication (CVE-2021-33882, CWE-287), information exposure (CWE-200), cleartext transmission of sensitive data (CWE-319), and improper input validation or privilege management.
+
+**Real-World Attack Vectors & Targeted Devices:** Documented vulnerabilities affect diverse equipment—including patient monitors, diagnostic imaging systems (MRIs, CTs), infusion and insulin pumps, and implantable cardiac devices (pacemakers, defibrillators). Common vectors involve unencrypted protocols (such as Bluetooth Low Energy), built-in hardcoded backdoors, insecure web interfaces, and ransomware-induced device failures.
+
+**References**
+1. Bracciale, L., Loreti, P., & Bianchi, G. (2023). Cybersecurity vulnerability analysis of medical devices purchased by national health services. Scientific Reports, 13, 19509.
+2. Mathew, A., & Alex, H. (2022). Detect & protect-medical device cybersecurity. Current Overview of Science and Technology Research, 1, 60–68.
+3. Williams, P. A., & Woodward, A. J. (2015). Cybersecurity vulnerabilities in medical devices: a complex environment and multifaceted problem. Medical Devices: Evidence and Research, 8, 305–316.
